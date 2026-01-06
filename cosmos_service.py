@@ -1,0 +1,208 @@
+"""
+Cosmos DB Service for managing requirements and users
+"""
+from azure.cosmos.aio import CosmosClient
+from azure.cosmos import exceptions, PartitionKey
+from typing import Optional, List, Dict, Any
+import logging
+from datetime import datetime
+import uuid
+
+logger = logging.getLogger(__name__)
+
+
+class CosmosDBService:
+    """Service for interacting with Cosmos DB"""
+    
+    def __init__(self, endpoint: str, key: str, database_name: str, 
+                 requirements_container: str, users_container: str):
+        """Initialize Cosmos DB client and get references to existing containers"""
+        try:
+            # Create Cosmos client
+            self.client = CosmosClient(endpoint, credential=key)
+            
+            # Get existing database
+            self.database = self.client.get_database_client(database=database_name)
+            
+            # Get existing containers
+            self.requirements_container = self.database.get_container_client(
+                container=requirements_container
+            )
+            self.users_container = self.database.get_container_client(
+                container=users_container
+            )
+            
+            logger.info("Cosmos DB client initialized")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Cosmos DB client: {str(e)}", exc_info=True)
+            raise
+    
+    async def validate_connection(self):
+        """Validate Cosmos DB connection by reading database properties"""
+        try:
+            await self.database.read()
+            logger.info("Cosmos DB connection validated")
+        except Exception as e:
+            logger.error(f"Failed to validate Cosmos DB connection: {str(e)}", exc_info=True)
+            raise
+    
+    async def close(self):
+        """Close Cosmos DB client"""
+        if self.client:
+            await self.client.close()
+            logger.info("Cosmos DB connection closed")
+    
+    async def health_check(self) -> bool:
+        """Check if Cosmos DB is healthy"""
+        try:
+            if not self.database:
+                return False
+            await self.database.read()
+            return True
+        except Exception as e:
+            logger.error(f"Health check failed: {str(e)}")
+            return False
+    
+    async def get_user(self, tenant_id: str, username: str) -> Optional[Dict[str, Any]]:
+        """Get user by tenant ID and username"""
+        try:
+            query = "SELECT * FROM c WHERE c.tenantId = @tenantId AND c.username = @username"
+            parameters = [
+                {"name": "@tenantId", "value": tenant_id},
+                {"name": "@username", "value": username}
+            ]
+            
+            items = self.users_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=tenant_id
+            )
+            
+            async for item in items:
+                return item
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting user: {str(e)}", exc_info=True)
+            return None
+    
+    async def create_requirement(self, requirement_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new requirement in Cosmos DB"""
+        try:
+            # Generate unique ID
+            requirement_data["id"] = str(uuid.uuid4())
+            
+            # Add timestamps
+            current_time = datetime.utcnow().isoformat() + "Z"
+            requirement_data["createdAt"] = current_time
+            requirement_data["updatedAt"] = current_time
+            
+            # Insert into Cosmos DB
+            created_item = await self.requirements_container.create_item(
+                body=requirement_data,
+                enable_automatic_id_generation=False
+            )
+            
+            logger.info(f"Created requirement: {created_item['id']}")
+            return created_item
+            
+        except Exception as e:
+            logger.error(f"Error creating requirement: {str(e)}", exc_info=True)
+            raise
+    
+    async def get_requirement(self, requirement_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """Get a specific requirement by ID and tenant"""
+        try:
+            query = "SELECT * FROM c WHERE c.id = @id AND c.tenantId = @tenantId"
+            parameters = [
+                {"name": "@id", "value": requirement_id},
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+            
+            items = self.requirements_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=tenant_id
+            )
+            
+            async for item in items:
+                return item
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting requirement: {str(e)}", exc_info=True)
+            return None
+    
+    async def list_requirements(self, tenant_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """List all requirements for a tenant"""
+        try:
+            query = "SELECT * FROM c WHERE c.tenantId = @tenantId ORDER BY c.createdAt DESC"
+            parameters = [
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+            
+            items = self.requirements_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=tenant_id,
+                max_item_count=limit
+            )
+            
+            results = []
+            async for item in items:
+                results.append(item)
+                if len(results) >= limit:
+                    break
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error listing requirements: {str(e)}", exc_info=True)
+            return []
+    
+    async def update_requirement(self, requirement_id: str, tenant_id: str, 
+                                 updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update an existing requirement"""
+        try:
+            # Get existing requirement
+            existing = await self.get_requirement(requirement_id, tenant_id)
+            if not existing:
+                return None
+            
+            # Apply updates
+            existing.update(updates)
+            existing["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+            
+            # Replace in Cosmos DB
+            updated_item = await self.requirements_container.replace_item(
+                item=existing["id"],
+                body=existing
+            )
+            
+            logger.info(f"Updated requirement: {requirement_id}")
+            return updated_item
+            
+        except Exception as e:
+            logger.error(f"Error updating requirement: {str(e)}", exc_info=True)
+            raise
+    
+    async def delete_requirement(self, requirement_id: str, tenant_id: str) -> bool:
+        """Delete a requirement"""
+        try:
+            await self.requirements_container.delete_item(
+                item=requirement_id,
+                partition_key=tenant_id
+            )
+            
+            logger.info(f"Deleted requirement: {requirement_id}")
+            return True
+            
+        except exceptions.CosmosResourceNotFoundError:
+            logger.warning(f"Requirement not found: {requirement_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error deleting requirement: {str(e)}", exc_info=True)
+            raise

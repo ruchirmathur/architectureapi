@@ -4,15 +4,11 @@ FastAPI application for storing architecture requirements in Cosmos DB
 """
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 import logging
 import os
-import jwt
-from jwt import PyJWKClient
-from jwt.exceptions import InvalidTokenError, ExpiredSignatureError
 
 from cosmos_service import CosmosDBService
 
@@ -28,14 +24,8 @@ COSMOS_REQUIREMENTS_CONTAINER = os.getenv("COSMOS_REQUIREMENTS_CONTAINER", "requ
 COSMOS_USERS_CONTAINER = os.getenv("COSMOS_USERS_CONTAINER", "users")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
-# Auth0 Configuration
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN")  # e.g., "your-tenant.auth0.com"
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")  # e.g., "https://your-api-identifier"
-AUTH0_ALGORITHMS = ["RS256"]
-
 # Global cosmos service instance
 cosmos_service: Optional[CosmosDBService] = None
-security = HTTPBearer()
 
 
 # ==================== DATA MODELS ====================
@@ -118,16 +108,13 @@ def get_cosmos_service() -> CosmosDBService:
 
 
 async def get_current_user(
-    # credentials: HTTPAuthorizationCredentials = Depends(security),  # Commented out for development
     x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-Id"),
     x_username: Optional[str] = Header(None, alias="X-Username")
 ) -> AuthenticatedUser:
     """
-    Simple header-based authentication for development
-    JWT validation is commented out - use X-Tenant-Id and X-Username headers
+    Simple header-based authentication using X-Tenant-Id and X-Username headers
     """
     try:
-        # Simple header-based auth (for development)
         # Use default values if headers are not provided
         tenant_id = x_tenant_id or "default_tenant"
         username = x_username or "anonymous"
@@ -139,62 +126,6 @@ async def get_current_user(
             username=username,
             email=f"{username}@example.com"
         )
-        
-        # ===== JWT VALIDATION (COMMENTED OUT FOR DEVELOPMENT) =====
-        # token = credentials.credentials
-        # 
-        # # Development fallback (disable in production)
-        # if not AUTH0_DOMAIN or not AUTH0_AUDIENCE:
-        #     raise HTTPException(
-        #         status_code=500,
-        #         detail="Auth0 not configured. Set AUTH0_DOMAIN and AUTH0_AUDIENCE environment variables."
-        #     )
-        # 
-        # # Get Auth0 public key
-        # jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-        # jwks_client = PyJWKClient(jwks_url)
-        # signing_key = jwks_client.get_signing_key_from_jwt(token)
-        # 
-        # # Verify and decode JWT
-        # payload = jwt.decode(
-        #     token,
-        #     signing_key.key,
-        #     algorithms=AUTH0_ALGORITHMS,
-        #     audience=AUTH0_AUDIENCE,
-        #     issuer=f"https://{AUTH0_DOMAIN}/"
-        # )
-        # 
-        # # Extract user information from JWT claims
-        # user_id = payload.get("sub")
-        # email = payload.get("email")
-        # username = payload.get("preferred_username") or payload.get("nickname") or email
-        # 
-        # # Extract tenant_id from custom claim
-        # tenant_id = (
-        #     payload.get("https://yourapp.com/tenant_id") or 
-        #     payload.get("tenant_id") or
-        #     payload.get("org_id") or
-        #     x_tenant_id
-        # )
-        # 
-        # if not user_id:
-        #     raise HTTPException(
-        #         status_code=401,
-        #         detail="Invalid token: missing user ID (sub claim)"
-        #     )
-        # 
-        # if not tenant_id:
-        #     raise HTTPException(
-        #         status_code=401,
-        #         detail="Invalid token: missing tenant_id claim."
-        #     )
-        # 
-        # return AuthenticatedUser(
-        #     tenant_id=tenant_id,
-        #     user_id=user_id,
-        #     username=username or "unknown",
-        #     email=email or ""
-        # )
         
     except HTTPException:
         raise
@@ -283,7 +214,7 @@ async def create_requirement(
     """
     Create a new architecture requirement in Cosmos DB
     
-    Security: Requires valid JWT token with tenant and user claims
+    Security: Uses header-based authentication with X-Tenant-Id and X-Username
     """
     try:
         logger.info(

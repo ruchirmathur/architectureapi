@@ -136,6 +136,30 @@ class CosmosDBService:
             logger.error(f"Error getting requirement: {str(e)}", exc_info=True)
             return None
     
+    async def get_requirement_by_session(self, session_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """Get a requirement by sessionId and tenant"""
+        try:
+            query = "SELECT * FROM c WHERE c.sessionId = @sessionId AND c.tenantId = @tenantId"
+            parameters = [
+                {"name": "@sessionId", "value": session_id},
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+            
+            items = self.requirements_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=tenant_id
+            )
+            
+            async for item in items:
+                return item
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting requirement by session: {str(e)}", exc_info=True)
+            return None
+    
     async def list_requirements(self, tenant_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """List all requirements for a tenant"""
         try:

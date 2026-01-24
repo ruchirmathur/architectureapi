@@ -959,16 +959,32 @@ Based on these requirements, provide comprehensive architecture recommendations 
         )
         
         logger.info("Creating response object...")
-        response = ArchitectureRecommendationResponse(
-            success=True,
-            message="Architecture recommendations generated successfully",
-            tenantId=request.tenantId,
-            sessionId=request.sessionId,
-            architectures=architectures
-        )
-        logger.info("Response object created successfully")
-        
-        return response
+        try:
+            response = ArchitectureRecommendationResponse(
+                success=True,
+                message="Architecture recommendations generated successfully",
+                tenantId=request.tenantId,
+                sessionId=request.sessionId,
+                architectures=architectures
+            )
+            logger.info("Response object created successfully")
+            
+            # Try to serialize to dict to check for serialization issues
+            logger.info("Attempting to serialize response to dict...")
+            response_dict = response.model_dump()
+            logger.info(f"Response serialized successfully. Size: {len(str(response_dict))} characters")
+            
+            logger.info("Returning response...")
+            return response
+            
+        except Exception as serialize_error:
+            logger.error(f"Error during response creation or serialization: {str(serialize_error)}", exc_info=True)
+            logger.error(f"Number of architectures: {len(architectures)}")
+            for idx, arch in enumerate(architectures):
+                logger.error(f"Architecture {idx + 1} ID: {arch.id}, has diagram: {arch.diagram is not None}")
+                if arch.diagram:
+                    logger.error(f"Architecture {idx + 1} diagram has {len(arch.diagram.shapes)} shapes")
+            raise
         
     except HTTPException as http_ex:
         logger.error(f"HTTP exception in get_architecture_recommendations: {http_ex.detail}", exc_info=True)

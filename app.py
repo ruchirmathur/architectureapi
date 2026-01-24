@@ -574,14 +574,19 @@ async def get_architecture_recommendations(
     try:
         logger.info(
             f"Received architecture recommendation request for tenant: {request.tenantId}, "
-            f"session: {request.sessionId}"
+            f"session: {request.sessionId}, user: {current_user.username}"
         )
+        logger.info(f"Overview length: {len(request.overview)} characters")
         
         if not OPENAI_API_KEY:
+            logger.error("OpenAI API key is not configured")
             raise HTTPException(
                 status_code=500,
                 detail="OpenAI API key is not configured"
             )
+        
+        logger.info(f"OpenAI endpoint: {OPENAI_ENDPOINT}")
+        logger.info(f"OpenAI deployment: {OPENAI_DEPLOYMENT}")
         
         # Construct the prompt for OpenAI using the overview from the request
         system_prompt = """You are an expert software and cloud architect with deep knowledge of production systems, cloud platforms, and proven architectural patterns. 
@@ -748,6 +753,7 @@ Be concise. Rank architectures 1-4 based on fit to requirements (1 is best). Set
 
         # Truncate overview if too long to save tokens
         overview_text = request.overview[:MAX_OVERVIEW_LENGTH] if len(request.overview) > MAX_OVERVIEW_LENGTH else request.overview
+        logger.info(f"Truncated overview to {len(overview_text)} characters")
         
         user_prompt = f"""Please analyze the following application requirements overview and provide architecture recommendations:
 
@@ -756,21 +762,33 @@ APPLICATION REQUIREMENTS:
 
 Based on these requirements, provide comprehensive architecture recommendations as a JSON object."""
 
+        logger.info("Creating OpenAI client...")
         # Call Azure OpenAI API
-        client = OpenAI(
-            base_url=OPENAI_ENDPOINT,
-            api_key=OPENAI_API_KEY
-        )
+        try:
+            client = OpenAI(
+                base_url=OPENAI_ENDPOINT,
+                api_key=OPENAI_API_KEY
+            )
+            logger.info("OpenAI client created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create OpenAI client: {str(e)}", exc_info=True)
+            raise
         
-        completion = client.chat.completions.create(
-            model=OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
-            max_completion_tokens=MAX_OUTPUT_TOKENS
-        )
+        logger.info("Calling OpenAI API...")
+        try:
+            completion = client.chat.completions.create(
+                model=OPENAI_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=MAX_OUTPUT_TOKENS
+            )
+            logger.info("OpenAI API call completed successfully")
+        except Exception as e:
+            logger.error(f"OpenAI API call failed: {str(e)}", exc_info=True)
+            raise
         
         # Parse the OpenAI response
         logger.info(f"OpenAI finish_reason: {completion.choices[0].finish_reason}")
@@ -787,12 +805,15 @@ Based on these requirements, provide comprehensive architecture recommendations 
                 detail=f"OpenAI returned empty response. Finish reason: {finish_reason}"
             )
         
-        logger.info(f"OpenAI raw response: {content}")  # Log full response for debugging
+        logger.info(f"OpenAI response length: {len(content)} characters")
+        logger.debug(f"OpenAI raw response: {content[:500]}...")  # Log first 500 chars
         
+        logger.info("Parsing JSON response...")
         try:
             recommendations_data = json.loads(content)
+            logger.info("JSON parsed successfully")
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {str(e)}. Content: {content}")
+            logger.error(f"JSON parse error: {str(e)}. Content preview: {content[:200]}", exc_info=True)
             raise HTTPException(
                 status_code=502,
                 detail=f"Failed to parse OpenAI response as JSON: {str(e)}"
@@ -800,132 +821,161 @@ Based on these requirements, provide comprehensive architecture recommendations 
         
         # Validate response structure
         if "architectures" not in recommendations_data:
-            logger.error(f"Missing 'architectures' key in response: {content}")
+            logger.error(f"Missing 'architectures' key in response. Keys found: {list(recommendations_data.keys())}")
             raise HTTPException(
                 status_code=502,
                 detail="OpenAI response missing 'architectures' key"
             )
         
+        logger.info(f"Found {len(recommendations_data.get('architectures', []))} architectures in response")
+        
         # Convert OpenAI response to full response model
         architectures = []
-        for arch in recommendations_data.get("architectures", []):
-            arch_id = arch.get("id", "unknown")
+        for idx, arch in enumerate(recommendations_data.get("architectures", [])):
+            logger.info(f"Processing architecture {idx + 1}...")
+            try:
+                arch_id = arch.get("id", "unknown")
+                logger.debug(f"Architecture ID: {arch_id}")
             
-            # Extract technology stack
-            tech_stack_data = arch.get("technologyStack", {})
-            infra_data = tech_stack_data.get("infra", {})
-            cicd_data = tech_stack_data.get("cicd", {})
+                # Extract technology stack
+                tech_stack_data = arch.get("technologyStack", {})
+                infra_data = tech_stack_data.get("infra", {})
+                cicd_data = tech_stack_data.get("cicd", {})
             
-            infrastructure = Infrastructure(
-                compute=infra_data.get("compute", ""),
-                database=infra_data.get("database", ""),
-                cache=infra_data.get("cache", ""),
-                messaging=infra_data.get("messaging", ""),
-                storage=infra_data.get("storage", ""),
-                apiGateway=infra_data.get("apiGateway", ""),
-                authentication=infra_data.get("authentication", ""),
-                security=infra_data.get("security", ""),
-                networking=infra_data.get("networking", ""),
-                monitoring=infra_data.get("monitoring", ""),
-                logging=infra_data.get("logging", "")
-            )
-            
-            cicd = CICD(
-                pipeline=cicd_data.get("pipeline", ""),
-                containerization=cicd_data.get("containerization", ""),
-                testing=cicd_data.get("testing", ""),
-                iac=cicd_data.get("iac", "")
-            )
-            
-            technology_stack = TechnologyStack(
-                languages=tech_stack_data.get("languages", ""),
-                frameworks=tech_stack_data.get("frameworks", ""),
-                runtime=tech_stack_data.get("runtime", ""),
-                cloudProvider=tech_stack_data.get("cloudProvider", ""),
-                infra=infrastructure,
-                cicd=cicd
-            )
-            
-            # Extract metrics
-            metrics_data = arch.get("metrics", {})
-            metrics = Metrics(
-                latency=metrics_data.get("latency", []),
-                throughput=metrics_data.get("throughput", []),
-                availability=metrics_data.get("availability", 0),
-                autoscaling=metrics_data.get("autoscaling", ""),
-                cost=metrics_data.get("cost", []),
-                scalability=metrics_data.get("scalability", 5),
-                reliability=metrics_data.get("reliability", 5),
-                maintainability=metrics_data.get("maintainability", 5),
-                complexity=metrics_data.get("complexity", 5)
-            )
-            
-            # Extract diagram
-            diagram = None
-            diagram_data = arch.get("diagram")
-            if diagram_data:
-                shapes = []
-                for shape_data in diagram_data.get("shapes", []):
-                    shape = DiagramShape(
-                        tool=shape_data.get("tool", ""),
-                        x=shape_data.get("x", 0),
-                        y=shape_data.get("y", 0),
-                        id=shape_data.get("id", ""),
-                        service=shape_data.get("service"),
-                        arrowType=shape_data.get("arrowType"),
-                        width=shape_data.get("width"),
-                        height=shape_data.get("height"),
-                        rotation=shape_data.get("rotation", 0),
-                        points=shape_data.get("points"),
-                        stroke=shape_data.get("stroke"),
-                        strokeWidth=shape_data.get("strokeWidth"),
-                        dash=shape_data.get("dash")
-                    )
-                    shapes.append(shape)
-                
-                diagram = ArchitectureDiagram(
-                    name=diagram_data.get("name", ""),
-                    description=diagram_data.get("description", ""),
-                    shapes=shapes
+                infrastructure = Infrastructure(
+                    compute=infra_data.get("compute", ""),
+                    database=infra_data.get("database", ""),
+                    cache=infra_data.get("cache", ""),
+                    messaging=infra_data.get("messaging", ""),
+                    storage=infra_data.get("storage", ""),
+                    apiGateway=infra_data.get("apiGateway", ""),
+                    authentication=infra_data.get("authentication", ""),
+                    security=infra_data.get("security", ""),
+                    networking=infra_data.get("networking", ""),
+                    monitoring=infra_data.get("monitoring", ""),
+                    logging=infra_data.get("logging", "")
                 )
+                logger.debug(f"Infrastructure created for {arch_id}")
             
-            # Build the full architecture object from OpenAI response
-            architecture = Architecture(
-                id=arch_id,
-                icon=f"/icons/{arch_id}.png",
-                name=arch.get("name", ""),
-                description=arch.get("description", ""),
-                ranking=arch.get("ranking", 1),
-                shortPros=arch.get("shortPros", ""),
-                shortCons=arch.get("shortCons", ""),
-                recommendationReason=arch.get("recommendationReason", ""),
-                whyChoose=arch.get("whyChoose", ""),
-                best=arch.get("best", False),
-                metrics=metrics,
-                technologyStack=technology_stack,
-                diagram=diagram,
-                bestFor=arch.get("bestFor", []),
-                avoidWhen=arch.get("avoidWhen", [])
-            )
-            architectures.append(architecture)
+                cicd = CICD(
+                    pipeline=cicd_data.get("pipeline", ""),
+                    containerization=cicd_data.get("containerization", ""),
+                    testing=cicd_data.get("testing", ""),
+                    iac=cicd_data.get("iac", "")
+                )
+                logger.debug(f"CICD created for {arch_id}")
+            
+                technology_stack = TechnologyStack(
+                    languages=tech_stack_data.get("languages", ""),
+                    frameworks=tech_stack_data.get("frameworks", ""),
+                    runtime=tech_stack_data.get("runtime", ""),
+                    cloudProvider=tech_stack_data.get("cloudProvider", ""),
+                    infra=infrastructure,
+                    cicd=cicd
+                )
+                logger.debug(f"Technology stack created for {arch_id}")
+            
+                # Extract metrics
+                metrics_data = arch.get("metrics", {})
+                metrics = Metrics(
+                    latency=metrics_data.get("latency", []),
+                    throughput=metrics_data.get("throughput", []),
+                    availability=metrics_data.get("availability", 0),
+                    autoscaling=metrics_data.get("autoscaling", ""),
+                    cost=metrics_data.get("cost", []),
+                    scalability=metrics_data.get("scalability", 5),
+                    reliability=metrics_data.get("reliability", 5),
+                    maintainability=metrics_data.get("maintainability", 5),
+                    complexity=metrics_data.get("complexity", 5)
+                )
+                logger.debug(f"Metrics created for {arch_id}")
+            
+                # Extract diagram
+                diagram = None
+                diagram_data = arch.get("diagram")
+                if diagram_data:
+                    logger.debug(f"Processing diagram for {arch_id}...")
+                    shapes = []
+                    for shape_idx, shape_data in enumerate(diagram_data.get("shapes", [])):
+                        try:
+                            shape = DiagramShape(
+                                tool=shape_data.get("tool", ""),
+                                x=shape_data.get("x", 0),
+                                y=shape_data.get("y", 0),
+                                id=shape_data.get("id", ""),
+                                service=shape_data.get("service"),
+                                arrowType=shape_data.get("arrowType"),
+                                width=shape_data.get("width"),
+                                height=shape_data.get("height"),
+                                rotation=shape_data.get("rotation", 0),
+                                points=shape_data.get("points"),
+                                stroke=shape_data.get("stroke"),
+                                strokeWidth=shape_data.get("strokeWidth"),
+                                dash=shape_data.get("dash")
+                            )
+                            shapes.append(shape)
+                        except Exception as shape_error:
+                            logger.error(f"Error creating shape {shape_idx} for {arch_id}: {str(shape_error)}", exc_info=True)
+                            logger.error(f"Shape data: {shape_data}")
+                            # Continue processing other shapes
+                    
+                    diagram = ArchitectureDiagram(
+                        name=diagram_data.get("name", ""),
+                        description=diagram_data.get("description", ""),
+                        shapes=shapes
+                    )
+                    logger.debug(f"Diagram created with {len(shapes)} shapes for {arch_id}")
+            
+                # Build the full architecture object from OpenAI response
+                architecture = Architecture(
+                    id=arch_id,
+                    icon=f"/icons/{arch_id}.png",
+                    name=arch.get("name", ""),
+                    description=arch.get("description", ""),
+                    ranking=arch.get("ranking", 1),
+                    shortPros=arch.get("shortPros", ""),
+                    shortCons=arch.get("shortCons", ""),
+                    recommendationReason=arch.get("recommendationReason", ""),
+                    whyChoose=arch.get("whyChoose", ""),
+                    best=arch.get("best", False),
+                    metrics=metrics,
+                    technologyStack=technology_stack,
+                    diagram=diagram,
+                    bestFor=arch.get("bestFor", []),
+                    avoidWhen=arch.get("avoidWhen", [])
+                )
+                architectures.append(architecture)
+                logger.info(f"Architecture {idx + 1} ({arch_id}) processed successfully")
+                
+            except Exception as arch_error:
+                logger.error(f"Error processing architecture {idx + 1}: {str(arch_error)}", exc_info=True)
+                logger.error(f"Architecture data: {arch}")
+                # Continue processing other architectures instead of failing completely
+                continue
         
         logger.info(
             f"Successfully generated {len(architectures)} architecture recommendations for "
             f"tenant: {request.tenantId}, session: {request.sessionId}"
         )
         
-        return ArchitectureRecommendationResponse(
+        logger.info("Creating response object...")
+        response = ArchitectureRecommendationResponse(
             success=True,
             message="Architecture recommendations generated successfully",
             tenantId=request.tenantId,
             sessionId=request.sessionId,
             architectures=architectures
         )
+        logger.info("Response object created successfully")
         
-    except HTTPException:
+        return response
+        
+    except HTTPException as http_ex:
+        logger.error(f"HTTP exception in get_architecture_recommendations: {http_ex.detail}", exc_info=True)
         raise
     except Exception as e:
-        logger.error(f"Error generating architecture recommendations: {str(e)}", exc_info=True)
+        logger.error(f"Unexpected error in get_architecture_recommendations: {str(e)}", exc_info=True)
+        logger.error(f"Error type: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate architecture recommendations: {str(e)}"

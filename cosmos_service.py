@@ -187,6 +187,30 @@ class CosmosDBService:
             logger.error(f"Error listing requirements: {str(e)}", exc_info=True)
             return []
     
+    async def get_requirement_by_application_name(self, application_name: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """Get requirement by application name for a tenant"""
+        try:
+            query = "SELECT * FROM c WHERE c.tenantId = @tenantId AND c.applicationName = @applicationName"
+            parameters = [
+                {"name": "@tenantId", "value": tenant_id},
+                {"name": "@applicationName", "value": application_name}
+            ]
+            
+            items = self.requirements_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=tenant_id
+            )
+            
+            async for item in items:
+                return item  # Return first match
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error querying requirement by application name: {str(e)}", exc_info=True)
+            return None
+    
     async def update_requirement(self, requirement_id: str, tenant_id: str, 
                                  updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Update an existing requirement"""

@@ -33,6 +33,7 @@ OPENAI_DEPLOYMENT = "gpt-5-mini"
 MAX_OVERVIEW_LENGTH = 4000  # Maximum characters for overview input
 MAX_OUTPUT_TOKENS = 16000  # Maximum tokens for OpenAI response (increased for diagram JSON)
 
+
 # Global cosmos service instance
 cosmos_service: Optional[CosmosDBService] = None
 
@@ -199,7 +200,6 @@ class Architecture(BaseModel):
     best: bool = False
     metrics: Metrics = Field(default_factory=Metrics)
     technologyStack: TechnologyStack = Field(default_factory=TechnologyStack)
-    diagram: Optional[ArchitectureDiagram] = None
     bestFor: List[str] = []
     avoidWhen: List[str] = []
 
@@ -353,6 +353,35 @@ async def create_requirement(
             tenant_id=requirement.tenantId
         )
         
+        # Check if application name already exists for this tenant
+        existing_app = await cosmos.get_requirement_by_application_name(
+            application_name=requirement.applicationName,
+            tenant_id=requirement.tenantId
+        )
+        
+        # Prevent duplicate app creation if incoming request hasn't progressed beyond Step 1
+        if existing_app and not existing_requirement:
+            # Get step transitions from incoming request
+            incoming_step_transitions = requirement.metadata.stepTransitions if requirement.metadata else []
+            completed_steps = {transition.step for transition in incoming_step_transitions}
+            
+            # Check if user has gone beyond Step 1 (applicationName)
+            # Allow overwrite only if they have at least one step beyond applicationName
+            steps_beyond_app_name = completed_steps - {"applicationName"}
+            
+            if not steps_beyond_app_name:
+                # User is still at Step 1 - don't allow duplicate
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error_code": "DUPLICATE_APPLICATION_NAME",
+                        "message": f"An application with the name '{requirement.applicationName}' already exists for this tenant. Duplicate applications are not allowed. Please use a different application name."
+                    }
+                )
+        
+        # Determine which requirement to update (prioritize existing_app for overwrite behavior)
+        requirement_to_update = existing_app or existing_requirement
+        
         # Add user info to requirement
         requirement_data = requirement.dict()
         requirement_data["username"] = current_user.username
@@ -366,11 +395,11 @@ async def create_requirement(
             else:
                 requirement_data["overview"] = generate_overview_from_requirements(requirement_data)
         
-        if existing_requirement:
-            # Update existing requirement
-            logger.info(f"Updating existing requirement: {existing_requirement['id']}")
+        if requirement_to_update:
+            # Update existing requirement (overwrite if same app name)
+            logger.info(f"Updating existing requirement: {requirement_to_update['id']}")
             saved_requirement = await cosmos.update_requirement(
-                requirement_id=existing_requirement["id"],
+                requirement_id=requirement_to_update["id"],
                 tenant_id=requirement.tenantId,
                 updates=requirement_data
             )
@@ -451,17 +480,17 @@ async def get_requirement(
 
 def calculate_requirement_status(req: Dict[str, Any]) -> str:
     """Calculate requirement status based on stepTransitions"""
-    # Define all 9 required steps
+    # Define all 8 required steps (matching actual step names in transitions)
+    # Note: applicationName is not included as it's a setup step, not part of the workflow
     required_steps = {
         "domain",
         "coreUseCases",
         "features",
+        "data",
         "nfrs",
         "userRoles",
-        "dataProfile",
         "security",
-        "performance",
-        "reliability"
+        "review"
     }
     
     # Get step transitions from metadata
@@ -471,7 +500,7 @@ def calculate_requirement_status(req: Dict[str, Any]) -> str:
     # Extract completed steps
     completed_steps = {transition.get("step") for transition in step_transitions if transition.get("step")}
     
-    # Check if all 9 steps are completed
+    # Check if all 8 steps are completed
     if required_steps.issubset(completed_steps):
         return "Complete"
     else:
@@ -666,88 +695,10 @@ Return a JSON object with this structure (populate all fields with thoughtful, i
         }
       },
       "bestFor": ["<scenario1>", "<scenario2>"],
-      "avoidWhen": ["<scenario1>", "<scenario2>"],
-      "diagram": {
-        "name": "<diagram title>",
-        "description": "<diagram description>",
-        "shapes": [
-          {
-            "tool": "<aws|azure|gcp|security>",
-            "x": <x-coordinate>,
-            "y": <y-coordinate>,
-            "id": "<unique-id>",
-            "service": "<service-name>",
-            "width": 64,
-            "height": 64,
-            "rotation": 0
-          },
-          {
-            "tool": "arrow",
-            "arrowType": "<single|double|dashed>",
-            "id": "<arrow-id>",
-            "points": [<x1>, <y1>, <x2>, <y2>],
-            "stroke": "<color-hex>",
-            "strokeWidth": <width>,
-            "dash": [<dash>, <gap>]
-          }
-        ]
-      }
+      "avoidWhen": ["<scenario1>", "<scenario2>"]
     }
   ]
 }
-
-DIAGRAM REQUIREMENTS - CRITICAL:
-1. **Canvas Dimensions**: Keep all shapes within 0-1000px width and 0-600px height
-2. **Tool Selection**: Use "aws" for AWS, "azure" for Azure, "gcp" for GCP based on cloudProvider in technologyStack
-3. **Service Mapping** - Map EXACTLY from technologyStack to diagram services:
-   - Compute: aws-lambda (serverless), aws-ecs/azure-container-instances (containers), aws-ec2/azure-vm (VMs), aws-eks/azure-aks (k8s)
-   - Database: aws-rds, aws-dynamodb, aws-aurora, azure-sql, azure-cosmos, gcp-cloud-sql
-   - Cache: aws-elasticache, azure-redis, gcp-memorystore
-   - Storage: aws-s3, azure-storage, gcp-cloud-storage
-   - Messaging: aws-sqs, aws-sns, azure-service-bus, gcp-pub-sub
-   - API Gateway: aws-api-gateway, azure-api-management, gcp-api-gateway
-   - Auth: security-auth0, security-azuread, security-cognito
-   - Monitoring: aws-cloudwatch, azure-monitor, gcp-operations
-   - Networking: aws-elb, aws-cloudfront, azure-front-door, azure-cdn, gcp-load-balancer
-
-4. **Layout Strategy** (FOLLOW EXACTLY):
-   - Row 1 (y: 50): DNS/CDN - center at x: 500
-   - Row 2 (y: 150): Load Balancer/API Gateway - center at x: 500
-   - Row 3 (y: 280): Authentication service - right side at x: 700
-   - Row 4 (y: 350): Application Services/Compute - spread evenly x: 200, 400, 600, 800 (use only as many as needed)
-   - Row 5 (y: 500): Data Layer (databases, cache, storage, queues) - spread evenly x: 200, 400, 600, 800
-
-5. **Arrow Positioning** - Calculate arrow points correctly:
-   - Shape center is at (x + 32, y + 32) since width/height is 64
-   - For vertical connections: same x-coordinate, different y values
-   - For horizontal: different x values, same y-coordinate
-   - Example: Shape at (400, 150) to shape at (400, 350): points: [432, 214, 432, 350]
-   - Always connect center-to-center or edge-to-edge properly
-
-6. **Connection Logic** - Only connect services that actually integrate:
-   - User traffic: DNS → CDN → Load Balancer → API Gateway
-   - API Gateway ↔ Authentication (bidirectional)
-   - API Gateway → Compute Services (one-way)
-   - Compute Services ↔ Databases (bidirectional for their specific DB)
-   - Compute Services ↔ Cache (bidirectional)
-   - Compute Services → Storage (one-way writes, or bidirectional for reads)
-   - Compute Services → Message Queues (one-way publish, or subscribe)
-   - DO NOT create random connections between unrelated services
-
-7. **Arrow Types & Colors**:
-   - "single": One-way data flow, use for: API calls, writes, publishes
-   - "double": Bidirectional, use for: database reads/writes, cache operations, auth validation
-   - "dashed": Optional/async, use for: monitoring, logging, background jobs
-   - Colors: #3498db (user traffic), #2ecc71 (service calls), #e74c3c (auth), #2c3e50 (database), #f39c12 (storage), #9b59b6 (events/queues)
-
-8. **Service Count**: Include only services mentioned in technologyStack - do not add extras. If compute is "Lambda", show 1-3 Lambda functions. If database is "RDS + DynamoDB", show both.
-
-9. **Validation**: Before finalizing, verify:
-   - All x coordinates are 50-950 (leaving 50px margin)
-   - All y coordinates are 50-550 (leaving 50px margin)
-   - Arrow points match actual shape center positions (x+32, y+32)
-   - No services are duplicated
-   - Every service shown is mentioned in technologyStack
 
 Be concise. Rank architectures 1-4 based on fit to requirements (1 is best). Set "best": true only for rank 1."""
 
@@ -890,42 +841,6 @@ Based on these requirements, provide comprehensive architecture recommendations 
                 )
                 logger.debug(f"Metrics created for {arch_id}")
             
-                # Extract diagram
-                diagram = None
-                diagram_data = arch.get("diagram")
-                if diagram_data:
-                    logger.debug(f"Processing diagram for {arch_id}...")
-                    shapes = []
-                    for shape_idx, shape_data in enumerate(diagram_data.get("shapes", [])):
-                        try:
-                            shape = DiagramShape(
-                                tool=shape_data.get("tool", ""),
-                                x=shape_data.get("x", 0),
-                                y=shape_data.get("y", 0),
-                                id=shape_data.get("id", ""),
-                                service=shape_data.get("service"),
-                                arrowType=shape_data.get("arrowType"),
-                                width=shape_data.get("width"),
-                                height=shape_data.get("height"),
-                                rotation=shape_data.get("rotation", 0),
-                                points=shape_data.get("points"),
-                                stroke=shape_data.get("stroke"),
-                                strokeWidth=shape_data.get("strokeWidth"),
-                                dash=shape_data.get("dash")
-                            )
-                            shapes.append(shape)
-                        except Exception as shape_error:
-                            logger.error(f"Error creating shape {shape_idx} for {arch_id}: {str(shape_error)}", exc_info=True)
-                            logger.error(f"Shape data: {shape_data}")
-                            # Continue processing other shapes
-                    
-                    diagram = ArchitectureDiagram(
-                        name=diagram_data.get("name", ""),
-                        description=diagram_data.get("description", ""),
-                        shapes=shapes
-                    )
-                    logger.debug(f"Diagram created with {len(shapes)} shapes for {arch_id}")
-            
                 # Build the full architecture object from OpenAI response
                 architecture = Architecture(
                     id=arch_id,
@@ -940,7 +855,6 @@ Based on these requirements, provide comprehensive architecture recommendations 
                     best=arch.get("best", False),
                     metrics=metrics,
                     technologyStack=technology_stack,
-                    diagram=diagram,
                     bestFor=arch.get("bestFor", []),
                     avoidWhen=arch.get("avoidWhen", [])
                 )

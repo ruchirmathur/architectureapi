@@ -648,18 +648,17 @@ async def get_architecture_recommendations(
         }
         
         # Send message to Service Bus
-        async with service_bus_client:
-            sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
-            async with sender:
-                message = ServiceBusMessage(
-                    body=json.dumps(queued_request),
-                    content_type="application/json"
-                )
-                await sender.send_messages(message)
-                logger.info(
-                    f"Message sent to Service Bus queue '{SERVICE_BUS_QUEUE_NAME}' for tenant: {request.tenantId}, "
-                    f"session: {request.sessionId}"
-                )
+        sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
+        async with sender:
+            message = ServiceBusMessage(
+                body=json.dumps(queued_request),
+                content_type="application/json"
+            )
+            await sender.send_messages(message)
+            logger.info(
+                f"Message sent to Service Bus queue '{SERVICE_BUS_QUEUE_NAME}' for tenant: {request.tenantId}, "
+                f"session: {request.sessionId}"
+            )
         
         # Return success response immediately
         return ArchitectureRecommendationResponse(

@@ -30,7 +30,7 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
 # Azure Service Bus Configuration
 SERVICE_BUS_CONNECTION_STRING = os.getenv("SERVICE_BUS_CONNECTION_STRING")
-SERVICE_BUS_QUEUE_NAME = os.getenv("SERVICE_BUS_QUEUE_NAME", "architecture-recommendations")
+SERVICE_BUS_QUEUE_NAME = os.getenv("AZURE_SERVICE_BUS_QUEUE", "architecture-recommendations")
 
 # Azure OpenAI Configuration
 OPENAI_ENDPOINT =os.getenv("OPENAI_ENDPOINT")
@@ -292,11 +292,16 @@ async def lifespan(app: FastAPI):
     
     # Initialize Service Bus client
     if SERVICE_BUS_CONNECTION_STRING:
-        service_bus_client = ServiceBusClient.from_connection_string(
-            conn_str=SERVICE_BUS_CONNECTION_STRING,
-            logging_enable=True
-        )
-        logger.info(f"Service Bus client initialized for queue: {SERVICE_BUS_QUEUE_NAME}")
+        try:
+            service_bus_client = ServiceBusClient.from_connection_string(
+                conn_str=SERVICE_BUS_CONNECTION_STRING,
+                logging_enable=True
+            )
+            logger.info(f"Service Bus client initialized for queue: {SERVICE_BUS_QUEUE_NAME}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Service Bus client: {str(e)}", exc_info=True)
+            logger.warning("Service Bus is not available - recommendation queueing will not work")
+            service_bus_client = None
     else:
         logger.warning("SERVICE_BUS_CONNECTION_STRING not configured - recommendation queueing will not work")
     
@@ -647,17 +652,29 @@ async def get_architecture_recommendations(
             }
         }
         
-        # Send message to Service Bus
-        sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
-        async with sender:
-            message = ServiceBusMessage(
-                body=json.dumps(queued_request),
-                content_type="application/json"
-            )
-            await sender.send_messages(message)
-            logger.info(
-                f"Message sent to Service Bus queue '{SERVICE_BUS_QUEUE_NAME}' for tenant: {request.tenantId}, "
-                f"session: {request.sessionId}"
+        # Send message to Service Bus with proper error handling
+        try:
+            sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
+            async with sender:
+                message = ServiceBusMessage(
+                    body=json.dumps(queued_request),
+                    content_type="application/json"
+                )
+                await sender.send_messages(message)
+                logger.info(
+                    f"Message sent to Service Bus queue '{SERVICE_BUS_QUEUE_NAME}' for tenant: {request.tenantId}, "
+                    f"session: {request.sessionId}"
+                )
+        except Exception as sb_error:
+            logger.error(f"Service Bus error: {str(sb_error)}", exc_info=True)
+            # Return error response with details
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "SERVICE_BUS_UNAVAILABLE",
+                    "message": f"Failed to queue request to Service Bus. The queue '{SERVICE_BUS_QUEUE_NAME}' may not exist or connection is misconfigured.",
+                    "details": str(sb_error)
+                }
             )
         
         # Return success response immediately
@@ -669,6 +686,8 @@ async def get_architecture_recommendations(
             architectures=None
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error queueing architecture recommendation request: {str(e)}", exc_info=True)
         raise HTTPException(

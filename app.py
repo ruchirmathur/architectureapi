@@ -121,6 +121,7 @@ class ArchitectureRecommendationRequest(BaseModel):
     """Request model for getting architecture recommendations from OpenAI"""
     tenantId: str = Field(..., description="Tenant ID")
     sessionId: str = Field(..., description="Session ID")
+    applicationName: str = Field(..., description="Application Name")
     overview: str = Field(..., description="Comprehensive application overview for architecture analysis", max_length=4000)
 
 
@@ -641,23 +642,12 @@ async def get_architecture_recommendations(
                 detail="Service Bus is not configured"
             )
         
-        # Create complete request data to queue (including user context)
-        queued_request = {
-            "request": request.model_dump(),
-            "user": {
-                "tenantId": current_user.tenant_id,
-                "userId": current_user.user_id,
-                "username": current_user.username,
-                "email": current_user.email
-            }
-        }
-        
         # Send message to Service Bus with proper error handling
         try:
             sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
             async with sender:
                 message = ServiceBusMessage(
-                    body=json.dumps(queued_request),
+                    body=json.dumps(request.model_dump()),
                     content_type="application/json"
                 )
                 await sender.send_messages(message)

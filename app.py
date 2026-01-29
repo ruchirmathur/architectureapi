@@ -11,6 +11,8 @@ import logging
 import os
 import json
 from openai import OpenAI
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus import ServiceBusMessage
 
 from cosmos_service import CosmosDBService
 
@@ -26,6 +28,10 @@ COSMOS_REQUIREMENTS_CONTAINER = os.getenv("COSMOS_REQUIREMENTS_CONTAINER", "requ
 COSMOS_USERS_CONTAINER = os.getenv("COSMOS_USERS_CONTAINER", "users")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
+# Azure Service Bus Configuration
+SERVICE_BUS_CONNECTION_STRING = os.getenv("SERVICE_BUS_CONNECTION_STRING")
+SERVICE_BUS_QUEUE_NAME = os.getenv("SERVICE_BUS_QUEUE_NAME", "architecture-recommendations")
+
 # Azure OpenAI Configuration
 OPENAI_ENDPOINT =os.getenv("OPENAI_ENDPOINT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -36,6 +42,9 @@ MAX_OUTPUT_TOKENS = 16000  # Maximum tokens for OpenAI response (increased for d
 
 # Global cosmos service instance
 cosmos_service: Optional[CosmosDBService] = None
+
+# Global Service Bus client for architecture recommendation requests
+service_bus_client: Optional[ServiceBusClient] = None
 
 
 # ==================== DATA MODELS ====================
@@ -267,7 +276,7 @@ async def get_current_user(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown"""
-    global cosmos_service
+    global cosmos_service, service_bus_client
     
     # Startup
     logger.info("Starting up Architecture Requirements API...")
@@ -281,12 +290,25 @@ async def lifespan(app: FastAPI):
     await cosmos_service.validate_connection()
     logger.info("Cosmos DB connection established and validated")
     
+    # Initialize Service Bus client
+    if SERVICE_BUS_CONNECTION_STRING:
+        service_bus_client = ServiceBusClient.from_connection_string(
+            conn_str=SERVICE_BUS_CONNECTION_STRING,
+            logging_enable=True
+        )
+        logger.info(f"Service Bus client initialized for queue: {SERVICE_BUS_QUEUE_NAME}")
+    else:
+        logger.warning("SERVICE_BUS_CONNECTION_STRING not configured - recommendation queueing will not work")
+    
     yield
     
     # Shutdown
     logger.info("Shutting down Architecture Requirements API...")
     if cosmos_service:
         await cosmos_service.close()
+    if service_bus_client:
+        await service_bus_client.close()
+        logger.info("Service Bus client closed")
     logger.info("Shutdown complete")
 
 
@@ -594,11 +616,10 @@ async def get_architecture_recommendations(
     current_user: AuthenticatedUser = Depends(get_current_user)
 ):
     """
-    Get architecture recommendations from OpenAI based on the application overview
+    Queue architecture recommendation request for asynchronous processing
     
-    This endpoint analyzes the provided application overview and returns
-    a list of architecture recommendations including cloud services,
-    design patterns, and best practices.
+    This endpoint accepts the application overview and queues it for processing.
+    Returns immediately with a success response.
     """
     try:
         logger.info(
@@ -607,308 +628,53 @@ async def get_architecture_recommendations(
         )
         logger.info(f"Overview length: {len(request.overview)} characters")
         
-        if not OPENAI_API_KEY:
-            logger.error("OpenAI API key is not configured")
+        # Validate Service Bus client is available
+        if not service_bus_client:
+            logger.error("Service Bus client not initialized")
             raise HTTPException(
                 status_code=500,
-                detail="OpenAI API key is not configured"
+                detail="Service Bus is not configured"
             )
         
-        logger.info(f"OpenAI endpoint: {OPENAI_ENDPOINT}")
-        logger.info(f"OpenAI deployment: {OPENAI_DEPLOYMENT}")
-        
-        # Construct the prompt for OpenAI using the overview from the request
-        system_prompt = """You are an expert software and cloud architect with deep knowledge of production systems, cloud platforms, and proven architectural patterns. 
-
-Analyze the provided application requirements and recommend 2-4 DISTINCT architecture patterns that are:
-- PRODUCTION-READY: Use proven, battle-tested technologies and patterns
-- COHERENT: All technology choices must work together seamlessly
-- COMPATIBLE: Ensure all components integrate well with each other
-- SPECIFIC: Use actual service names (e.g., "AWS Lambda" not "serverless compute")
-- REALISTIC: Base metrics and costs on real-world production data
-- APPROPRIATE: Match technology choices to the actual requirements (scale, traffic, complexity, team size)
-
-CRITICAL RULES:
-1. Each recommendation MUST use a DIFFERENT architectural pattern (e.g., Microservices, Serverless, Monolith, Event-Driven)
-2. Each recommendation should target a DIFFERENT cloud provider (AWS, Azure, or Google Cloud)
-3. Pick ONE primary technology stack per architecture - DO NOT mix incompatible technologies:
-   - Choose ONE language (e.g., "Java" OR "C#" OR "Python" OR "Node.js/TypeScript", NOT "Java, .NET")
-   - Framework must match the chosen language (Spring for Java, ASP.NET for C#, FastAPI for Python, Express for Node.js)
-   - Runtime must align with language (JVM for Java, .NET Runtime for C#, Python runtime, Node.js)
-   - All choices must form a SINGLE coherent tech stack
-4. Technology ecosystem coherence:
-   - Database must match data requirements and scale needs
-   - CI/CD tools should align with cloud provider and language
-   - Monitoring/logging should integrate with chosen platform
-   - Containerization approach should match deployment strategy
-5. Metrics must be realistic for the chosen architecture and scale
-6. Consider actual costs - don't randomly select expensive services for simple apps
-7. Security and networking choices should match compliance and architecture needs
-
-Return a JSON object with this structure (populate all fields with thoughtful, integrated recommendations):
-{
-  "architectures": [
-    {
-      "id": "<unique-kebab-case-id>",
-      "name": "<architecture pattern name>",
-      "description": "<brief description>",
-      "ranking": <1-4>,
-      "best": <true/false>,
-      "shortPros": "<one line advantages>",
-      "shortCons": "<one line drawbacks>",
-      "recommendationReason": "<why this fits>",
-      "whyChoose": "<why choose over alternatives>",
-      "metrics": {
-        "latency": [<min ms>, <max ms>],
-        "throughput": [<min req/s>, <max req/s>],
-        "availability": <percentage like 99.95>,
-        "autoscaling": "<Yes/No/Limited>",
-        "cost": [<min monthly USD>, <max monthly USD>],
-        "scalability": <1-10>,
-        "reliability": <1-10>,
-        "maintainability": <1-10>,
-        "complexity": <1-10>
-      },
-      "technologyStack": {
-        "languages": "<programming languages>",
-        "frameworks": "<frameworks>",
-        "runtime": "<runtime environment>",
-        "cloudProvider": "<AWS/Azure/GCP>",
-        "infra": {
-          "compute": "<compute services>",
-          "database": "<database services>",
-          "cache": "<caching services>",
-          "messaging": "<messaging services>",
-          "storage": "<storage services>",
-          "apiGateway": "<API gateway>",
-          "authentication": "<auth services>",
-          "security": "<security services>",
-          "networking": "<networking and load balancing>",
-          "monitoring": "<monitoring tools>",
-          "logging": "<logging services>"
-        },
-        "cicd": {
-          "pipeline": "<CI/CD pipeline tools>",
-          "containerization": "<container tools>",
-          "testing": "<testing frameworks>",
-          "iac": "<Infrastructure as Code tools>"
+        # Create complete request data to queue (including user context)
+        queued_request = {
+            "request": request.model_dump(),
+            "user": {
+                "tenantId": current_user.tenant_id,
+                "userId": current_user.user_id,
+                "username": current_user.username,
+                "email": current_user.email
+            }
         }
-      },
-      "bestFor": ["<scenario1>", "<scenario2>"],
-      "avoidWhen": ["<scenario1>", "<scenario2>"]
-    }
-  ]
-}
-
-Be concise. Rank architectures 1-4 based on fit to requirements (1 is best). Set "best": true only for rank 1."""
-
-        # Truncate overview if too long to save tokens
-        overview_text = request.overview[:MAX_OVERVIEW_LENGTH] if len(request.overview) > MAX_OVERVIEW_LENGTH else request.overview
-        logger.info(f"Truncated overview to {len(overview_text)} characters")
         
-        user_prompt = f"""Please analyze the following application requirements overview and provide architecture recommendations:
-
-APPLICATION REQUIREMENTS:
-{overview_text}
-
-Based on these requirements, provide comprehensive architecture recommendations as a JSON object."""
-
-        logger.info("Creating OpenAI client...")
-        # Call Azure OpenAI API
-        try:
-            client = OpenAI(
-                base_url=OPENAI_ENDPOINT,
-                api_key=OPENAI_API_KEY
-            )
-            logger.info("OpenAI client created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create OpenAI client: {str(e)}", exc_info=True)
-            raise
-        
-        logger.info("Calling OpenAI API...")
-        try:
-            completion = client.chat.completions.create(
-                model=OPENAI_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"},
-                max_completion_tokens=MAX_OUTPUT_TOKENS
-            )
-            logger.info("OpenAI API call completed successfully")
-        except Exception as e:
-            logger.error(f"OpenAI API call failed: {str(e)}", exc_info=True)
-            raise
-        
-        # Parse the OpenAI response
-        logger.info(f"OpenAI finish_reason: {completion.choices[0].finish_reason}")
-        logger.info(f"OpenAI usage: {completion.usage}")
-        
-        content = completion.choices[0].message.content
-        
-        # Handle None or empty content
-        if not content:
-            finish_reason = completion.choices[0].finish_reason
-            logger.error(f"OpenAI returned empty content. Finish reason: {finish_reason}")
-            raise HTTPException(
-                status_code=502,
-                detail=f"OpenAI returned empty response. Finish reason: {finish_reason}"
-            )
-        
-        logger.info(f"OpenAI response length: {len(content)} characters")
-        logger.debug(f"OpenAI raw response: {content[:500]}...")  # Log first 500 chars
-        
-        logger.info("Parsing JSON response...")
-        try:
-            recommendations_data = json.loads(content)
-            logger.info("JSON parsed successfully")
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {str(e)}. Content preview: {content[:200]}", exc_info=True)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Failed to parse OpenAI response as JSON: {str(e)}"
-            )
-        
-        # Validate response structure
-        if "architectures" not in recommendations_data:
-            logger.error(f"Missing 'architectures' key in response. Keys found: {list(recommendations_data.keys())}")
-            raise HTTPException(
-                status_code=502,
-                detail="OpenAI response missing 'architectures' key"
-            )
-        
-        logger.info(f"Found {len(recommendations_data.get('architectures', []))} architectures in response")
-        
-        # Convert OpenAI response to full response model
-        architectures = []
-        for idx, arch in enumerate(recommendations_data.get("architectures", [])):
-            logger.info(f"Processing architecture {idx + 1}...")
-            try:
-                arch_id = arch.get("id", "unknown")
-                logger.debug(f"Architecture ID: {arch_id}")
-            
-                # Extract technology stack
-                tech_stack_data = arch.get("technologyStack", {})
-                infra_data = tech_stack_data.get("infra", {})
-                cicd_data = tech_stack_data.get("cicd", {})
-            
-                infrastructure = Infrastructure(
-                    compute=infra_data.get("compute", ""),
-                    database=infra_data.get("database", ""),
-                    cache=infra_data.get("cache", ""),
-                    messaging=infra_data.get("messaging", ""),
-                    storage=infra_data.get("storage", ""),
-                    apiGateway=infra_data.get("apiGateway", ""),
-                    authentication=infra_data.get("authentication", ""),
-                    security=infra_data.get("security", ""),
-                    networking=infra_data.get("networking", ""),
-                    monitoring=infra_data.get("monitoring", ""),
-                    logging=infra_data.get("logging", "")
+        # Send message to Service Bus
+        async with service_bus_client:
+            sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
+            async with sender:
+                message = ServiceBusMessage(
+                    body=json.dumps(queued_request),
+                    content_type="application/json"
                 )
-                logger.debug(f"Infrastructure created for {arch_id}")
-            
-                cicd = CICD(
-                    pipeline=cicd_data.get("pipeline", ""),
-                    containerization=cicd_data.get("containerization", ""),
-                    testing=cicd_data.get("testing", ""),
-                    iac=cicd_data.get("iac", "")
+                await sender.send_messages(message)
+                logger.info(
+                    f"Message sent to Service Bus queue '{SERVICE_BUS_QUEUE_NAME}' for tenant: {request.tenantId}, "
+                    f"session: {request.sessionId}"
                 )
-                logger.debug(f"CICD created for {arch_id}")
-            
-                technology_stack = TechnologyStack(
-                    languages=tech_stack_data.get("languages", ""),
-                    frameworks=tech_stack_data.get("frameworks", ""),
-                    runtime=tech_stack_data.get("runtime", ""),
-                    cloudProvider=tech_stack_data.get("cloudProvider", ""),
-                    infra=infrastructure,
-                    cicd=cicd
-                )
-                logger.debug(f"Technology stack created for {arch_id}")
-            
-                # Extract metrics
-                metrics_data = arch.get("metrics", {})
-                metrics = Metrics(
-                    latency=metrics_data.get("latency", []),
-                    throughput=metrics_data.get("throughput", []),
-                    availability=metrics_data.get("availability", 0),
-                    autoscaling=metrics_data.get("autoscaling", ""),
-                    cost=metrics_data.get("cost", []),
-                    scalability=metrics_data.get("scalability", 5),
-                    reliability=metrics_data.get("reliability", 5),
-                    maintainability=metrics_data.get("maintainability", 5),
-                    complexity=metrics_data.get("complexity", 5)
-                )
-                logger.debug(f"Metrics created for {arch_id}")
-            
-                # Build the full architecture object from OpenAI response
-                architecture = Architecture(
-                    id=arch_id,
-                    icon=f"/icons/{arch_id}.png",
-                    name=arch.get("name", ""),
-                    description=arch.get("description", ""),
-                    ranking=arch.get("ranking", 1),
-                    shortPros=arch.get("shortPros", ""),
-                    shortCons=arch.get("shortCons", ""),
-                    recommendationReason=arch.get("recommendationReason", ""),
-                    whyChoose=arch.get("whyChoose", ""),
-                    best=arch.get("best", False),
-                    metrics=metrics,
-                    technologyStack=technology_stack,
-                    bestFor=arch.get("bestFor", []),
-                    avoidWhen=arch.get("avoidWhen", [])
-                )
-                architectures.append(architecture)
-                logger.info(f"Architecture {idx + 1} ({arch_id}) processed successfully")
-                
-            except Exception as arch_error:
-                logger.error(f"Error processing architecture {idx + 1}: {str(arch_error)}", exc_info=True)
-                logger.error(f"Architecture data: {arch}")
-                # Continue processing other architectures instead of failing completely
-                continue
         
-        logger.info(
-            f"Successfully generated {len(architectures)} architecture recommendations for "
-            f"tenant: {request.tenantId}, session: {request.sessionId}"
+        # Return success response immediately
+        return ArchitectureRecommendationResponse(
+            success=True,
+            message="Architecture recommendation request queued successfully",
+            tenantId=request.tenantId,
+            sessionId=request.sessionId,
+            architectures=None
         )
         
-        logger.info("Creating response object...")
-        try:
-            response = ArchitectureRecommendationResponse(
-                success=True,
-                message="Architecture recommendations generated successfully",
-                tenantId=request.tenantId,
-                sessionId=request.sessionId,
-                architectures=architectures
-            )
-            logger.info("Response object created successfully")
-            
-            # Try to serialize to dict to check for serialization issues
-            logger.info("Attempting to serialize response to dict...")
-            response_dict = response.model_dump()
-            logger.info(f"Response serialized successfully. Size: {len(str(response_dict))} characters")
-            
-            logger.info("Returning response...")
-            return response
-            
-        except Exception as serialize_error:
-            logger.error(f"Error during response creation or serialization: {str(serialize_error)}", exc_info=True)
-            logger.error(f"Number of architectures: {len(architectures)}")
-            for idx, arch in enumerate(architectures):
-                logger.error(f"Architecture {idx + 1} ID: {arch.id}, has diagram: {arch.diagram is not None}")
-                if arch.diagram:
-                    logger.error(f"Architecture {idx + 1} diagram has {len(arch.diagram.shapes)} shapes")
-            raise
-        
-    except HTTPException as http_ex:
-        logger.error(f"HTTP exception in get_architecture_recommendations: {http_ex.detail}", exc_info=True)
-        raise
     except Exception as e:
-        logger.error(f"Unexpected error in get_architecture_recommendations: {str(e)}", exc_info=True)
-        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error queueing architecture recommendation request: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to generate architecture recommendations: {str(e)}"
+            detail=f"Failed to queue architecture recommendation request: {str(e)}"
         )
 
 

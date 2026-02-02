@@ -37,7 +37,7 @@ SERVICE_BUS_CONNECTION_STRING = os.getenv("SERVICE_BUS_CONNECTION_STRING")
 SERVICE_BUS_QUEUE_NAME = os.getenv("AZURE_SERVICE_BUS_QUEUE", "architecture-recommendations")
 
 # Azure SignalR Service Configuration
-SIGNALR_CONNECTION_STRING = os.getenv("AZURE_SIGNALR_CONNECTION_STRING")
+SIGNALR_CONNECTION_STRING = os.getenv("AZURE_SIGNALR_NAME")
 SIGNALR_HUB_NAME = "architectureHub"
 
 # Azure OpenAI Configuration

@@ -728,6 +728,11 @@ class SignalRConnectionInfo(BaseModel):
     accessToken: str
 
 
+class SignalRNegotiateRequest(BaseModel):
+    """Request model for SignalR negotiate"""
+    userId: str = Field(..., description="User ID for SignalR connection")
+
+
 def generate_signalr_token(hub_name: str, user_id: str) -> str:
     """Generate SignalR access token using HMAC"""
     if not signalr_endpoint or not signalr_access_key:
@@ -758,7 +763,7 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
 
 @app.post("/api/signalr/negotiate", response_model=SignalRConnectionInfo)
 async def signalr_negotiate(
-    current_user: AuthenticatedUser = Depends(get_current_user)
+    request: SignalRNegotiateRequest
 ):
     """SignalR negotiate endpoint for client connections"""
     try:
@@ -769,12 +774,12 @@ async def signalr_negotiate(
             )
         
         # Generate access token for the user
-        access_token = generate_signalr_token(SIGNALR_HUB_NAME, current_user.user_id)
+        access_token = generate_signalr_token(SIGNALR_HUB_NAME, request.userId)
         
         # Construct client connection URL
         connection_url = f"{signalr_endpoint}/client/?hub={SIGNALR_HUB_NAME}"
         
-        logger.info(f"SignalR connection negotiated for user: {current_user.username}")
+        logger.info(f"SignalR connection negotiated for user: {request.userId}")
         
         return SignalRConnectionInfo(
             url=connection_url,

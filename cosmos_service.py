@@ -32,8 +32,6 @@ class CosmosDBService:
                 container=users_container
             )
             
-            logger.info("Cosmos DB client initialized")
-            
         except Exception as e:
             logger.error(f"Failed to initialize Cosmos DB client: {str(e)}", exc_info=True)
             raise
@@ -42,7 +40,6 @@ class CosmosDBService:
         """Validate Cosmos DB connection by reading database properties"""
         try:
             await self.database.read()
-            logger.info("Cosmos DB connection validated")
         except Exception as e:
             logger.error(f"Failed to validate Cosmos DB connection: {str(e)}", exc_info=True)
             raise

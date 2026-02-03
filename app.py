@@ -21,8 +21,14 @@ import requests
 from cosmos_service import CosmosDBService
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.ERROR)
+
+# Suppress Azure SDK verbose logging
+logging.getLogger('azure').setLevel(logging.ERROR)
+logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.ERROR)
+logging.getLogger('cosmos_service').setLevel(logging.ERROR)
 
 # Configuration from environment variables
 COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT", "https://architecture.documents.azure.com:443/")

@@ -266,7 +266,6 @@ async def get_current_user(
         tenant_id = x_tenant_id or "default_tenant"
         username = x_username or "anonymous"
         
-        logger.info(f"Using header-based auth - tenant: {tenant_id}, user: {username}")
         return AuthenticatedUser(
             tenant_id=tenant_id,
             user_id=username,
@@ -292,7 +291,11 @@ async def lifespan(app: FastAPI):
     global cosmos_service, service_bus_client, signalr_endpoint, signalr_access_key
     
     # Startup
-    logger.info("Starting up Architecture Requirements API...")
+    # Validate required environment variables
+    if not COSMOS_KEY:
+        logger.error("COSMOS_KEY environment variable is not set")
+        raise ValueError("COSMOS_KEY is required but not configured")
+    
     cosmos_service = CosmosDBService(
         endpoint=COSMOS_ENDPOINT,
         key=COSMOS_KEY,
@@ -300,8 +303,12 @@ async def lifespan(app: FastAPI):
         requirements_container=COSMOS_REQUIREMENTS_CONTAINER,
         users_container=COSMOS_USERS_CONTAINER
     )
-    await cosmos_service.validate_connection()
-    logger.info("Cosmos DB connection established and validated")
+    
+    try:
+        await cosmos_service.validate_connection()
+    except Exception as e:
+        logger.error(f"Failed to connect to Cosmos DB: {str(e)}", exc_info=True)
+        raise
     
     # Initialize SignalR configuration
     if SIGNALR_CONNECTION_STRING:
@@ -309,54 +316,40 @@ async def lifespan(app: FastAPI):
             # Parse SignalR connection string
             parts = SIGNALR_CONNECTION_STRING.split(';')
             for part in parts:
+                part = part.strip()
                 if part.startswith('Endpoint='):
                     signalr_endpoint = part.split('=', 1)[1]
                 elif part.startswith('AccessKey='):
                     signalr_access_key = part.split('=', 1)[1]
+                elif part.startswith('Version='):
+                    pass
             
-            if signalr_endpoint and signalr_access_key:
-                logger.info(f"SignalR Service initialized: {signalr_endpoint}")
-                logger.info(f"SignalR Access Key length: {len(signalr_access_key)} characters")
-                # Validate that the access key is valid base64
-                try:
-                    test_decode = base64.b64decode(signalr_access_key)
-                    logger.info(f"SignalR Access Key decoded length: {len(test_decode)} bytes")
-                except Exception as decode_err:
-                    logger.error(f"SignalR Access Key is not valid base64: {decode_err}")
-            else:
-                logger.warning("SignalR connection string is incomplete")
+            if not (signalr_endpoint and signalr_access_key):
+                signalr_endpoint = None
+                signalr_access_key = None
         except Exception as e:
             logger.error(f"Failed to parse SignalR connection string: {str(e)}")
             signalr_endpoint = None
             signalr_access_key = None
-    else:
-        logger.warning("AZURE_SIGNALR_CONNECTION_STRING not configured - real-time notifications will not work")
     
     # Initialize Service Bus client
     if SERVICE_BUS_CONNECTION_STRING:
         try:
             service_bus_client = ServiceBusClient.from_connection_string(
                 conn_str=SERVICE_BUS_CONNECTION_STRING,
-                logging_enable=True
+                logging_enable=False
             )
-            logger.info(f"Service Bus client initialized for queue: {SERVICE_BUS_QUEUE_NAME}")
         except Exception as e:
-            logger.error(f"Failed to initialize Service Bus client: {str(e)}", exc_info=True)
-            logger.warning("Service Bus is not available - recommendation queueing will not work")
+            logger.error(f"Failed to initialize Service Bus client: {str(e)}")
             service_bus_client = None
-    else:
-        logger.warning("SERVICE_BUS_CONNECTION_STRING not configured - recommendation queueing will not work")
     
     yield
     
     # Shutdown
-    logger.info("Shutting down Architecture Requirements API...")
     if cosmos_service:
         await cosmos_service.close()
     if service_bus_client:
         await service_bus_client.close()
-        logger.info("Service Bus client closed")
-    logger.info("Shutdown complete")
 
 
 # Initialize FastAPI app
@@ -411,11 +404,6 @@ async def create_requirement(
     Security: Uses header-based authentication with X-Tenant-Id and X-Username
     """
     try:
-        logger.info(
-            f"Received requirement creation request for tenant: {requirement.tenantId}, "
-            f"session: {requirement.sessionId}, user: {current_user.username}"
-        )
-        
         # Check if a requirement already exists for this session
         existing_requirement = await cosmos.get_requirement_by_session(
             session_id=requirement.sessionId,
@@ -976,4 +964,5 @@ async def signalr_send(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

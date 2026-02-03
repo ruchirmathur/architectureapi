@@ -316,6 +316,13 @@ async def lifespan(app: FastAPI):
             
             if signalr_endpoint and signalr_access_key:
                 logger.info(f"SignalR Service initialized: {signalr_endpoint}")
+                logger.info(f"SignalR Access Key length: {len(signalr_access_key)} characters")
+                # Validate that the access key is valid base64
+                try:
+                    test_decode = base64.b64decode(signalr_access_key)
+                    logger.info(f"SignalR Access Key decoded length: {len(test_decode)} bytes")
+                except Exception as decode_err:
+                    logger.error(f"SignalR Access Key is not valid base64: {decode_err}")
             else:
                 logger.warning("SignalR connection string is incomplete")
         except Exception as e:
@@ -740,7 +747,8 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
     
     import time
     
-    # Construct audience (base endpoint without trailing slash)
+    # Construct audience - must match SignalR service expectations exactly
+    # Azure SignalR expects: https://<name>.service.signalr.net/client/?hub=<hubname>
     base_endpoint = signalr_endpoint.rstrip('/')
     audience = f"{base_endpoint}/client/?hub={hub_name}"
     
@@ -754,11 +762,12 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
         "typ": "JWT"
     }
     
-    # JWT Payload
+    # JWT Payload - Azure SignalR requires specific claims
     payload = {
         "aud": audience,
         "iat": iat,
-        "exp": exp
+        "exp": exp,
+        "nbf": iat  # Not before time (same as issued at)
     }
     
     # Add user claim if provided
@@ -776,13 +785,24 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
     # Create signature base
     signing_input = f"{encoded_header}.{encoded_payload}"
     
-    # Sign with HMAC-SHA256
-    key_bytes = base64.b64decode(signalr_access_key)
-    signature = hmac.new(key_bytes, signing_input.encode('utf-8'), hashlib.sha256).digest()
-    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
+    # Sign with HMAC-SHA256 using the access key
+    try:
+        # The access key from connection string is already base64-encoded
+        key_bytes = base64.b64decode(signalr_access_key)
+        logger.info(f"Signing with key of length: {len(key_bytes)} bytes")
+        signature = hmac.new(key_bytes, signing_input.encode('utf-8'), hashlib.sha256).digest()
+        encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error signing token: {e}")
+        raise
     
     # Construct JWT
     jwt_token = f"{encoded_header}.{encoded_payload}.{encoded_signature}"
+    
+    logger.info(f"Generated JWT token for user {user_id}")
+    logger.info(f"Token header: {encoded_header}")
+    logger.info(f"Token audience: {audience}")
+    
     return jwt_token
 
 
@@ -869,11 +889,12 @@ async def send_signalr_message(
             "typ": "JWT"
         }
         
-        # JWT Payload
+        # JWT Payload - Azure SignalR requires specific claims for REST API
         payload_data = {
             "aud": audience,
             "iat": iat,
-            "exp": exp
+            "exp": exp,
+            "nbf": iat  # Not before time
         }
         
         # Encode header and payload

@@ -13,10 +13,6 @@ import json
 from openai import OpenAI
 from azure.servicebus.aio import ServiceBusClient
 from azure.servicebus import ServiceBusMessage
-import hmac
-import hashlib
-import base64
-import requests
 
 from cosmos_service import CosmosDBService
 
@@ -42,10 +38,6 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 SERVICE_BUS_CONNECTION_STRING = os.getenv("SERVICE_BUS_CONNECTION_STRING")
 SERVICE_BUS_QUEUE_NAME = os.getenv("AZURE_SERVICE_BUS_QUEUE", "architecture-recommendations")
 
-# Azure SignalR Service Configuration
-SIGNALR_CONNECTION_STRING = os.getenv("AZURE_SIGNALR_CONNECTION_STRING")
-SIGNALR_HUB_NAME = "architectureHub"
-
 # Azure OpenAI Configuration
 OPENAI_ENDPOINT =os.getenv("OPENAI_ENDPOINT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -59,10 +51,6 @@ cosmos_service: Optional[CosmosDBService] = None
 
 # Global Service Bus client for architecture recommendation requests
 service_bus_client: Optional[ServiceBusClient] = None
-
-# SignalR service endpoint and key (parsed from connection string)
-signalr_endpoint: Optional[str] = None
-signalr_access_key: Optional[str] = None
 
 
 # ==================== DATA MODELS ====================
@@ -294,7 +282,7 @@ async def get_current_user(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown"""
-    global cosmos_service, service_bus_client, signalr_endpoint, signalr_access_key
+    global cosmos_service, service_bus_client
     
     # Startup
     # Validate required environment variables
@@ -315,28 +303,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to connect to Cosmos DB: {str(e)}", exc_info=True)
         raise
-    
-    # Initialize SignalR configuration
-    if SIGNALR_CONNECTION_STRING:
-        try:
-            # Parse SignalR connection string
-            parts = SIGNALR_CONNECTION_STRING.split(';')
-            for part in parts:
-                part = part.strip()
-                if part.startswith('Endpoint='):
-                    signalr_endpoint = part.split('=', 1)[1]
-                elif part.startswith('AccessKey='):
-                    signalr_access_key = part.split('=', 1)[1]
-                elif part.startswith('Version='):
-                    pass
-            
-            if not (signalr_endpoint and signalr_access_key):
-                signalr_endpoint = None
-                signalr_access_key = None
-        except Exception as e:
-            logger.error(f"Failed to parse SignalR connection string: {str(e)}")
-            signalr_endpoint = None
-            signalr_access_key = None
     
     # Initialize Service Bus client
     if SERVICE_BUS_CONNECTION_STRING:
@@ -460,7 +426,6 @@ async def create_requirement(
         
         if requirement_to_update:
             # Update existing requirement (overwrite if same app name)
-            logger.info(f"Updating existing requirement: {requirement_to_update['id']}")
             saved_requirement = await cosmos.update_requirement(
                 requirement_id=requirement_to_update["id"],
                 tenant_id=requirement.tenantId,
@@ -469,14 +434,11 @@ async def create_requirement(
             message = "Requirement updated successfully"
         else:
             # Create new requirement
-            logger.info("Creating new requirement")
             saved_requirement = await cosmos.create_requirement(requirement_data)
             message = "Requirement created successfully"
         
         # Add status field
         saved_requirement["status"] = calculate_requirement_status(saved_requirement)
-        
-        logger.info(f"Requirement saved successfully: {saved_requirement['id']}")
         
         return RequirementResponse(
             success=True,
@@ -663,12 +625,6 @@ async def get_architecture_recommendations(
     Returns immediately with a success response.
     """
     try:
-        logger.info(
-            f"Received architecture recommendation request for tenant: {request.tenantId}, "
-            f"session: {request.sessionId}, user: {current_user.username}"
-        )
-        logger.info(f"Overview length: {len(request.overview)} characters")
-        
         # Validate Service Bus client is available
         if not service_bus_client:
             logger.error("Service Bus client not initialized")
@@ -686,10 +642,6 @@ async def get_architecture_recommendations(
                     content_type="application/json"
                 )
                 await sender.send_messages(message)
-                logger.info(
-                    f"Message sent to Service Bus queue '{SERVICE_BUS_QUEUE_NAME}' for tenant: {request.tenantId}, "
-                    f"session: {request.sessionId}"
-                )
         except Exception as sb_error:
             logger.error(f"Service Bus error: {str(sb_error)}", exc_info=True)
             # Return error response with details
@@ -718,258 +670,6 @@ async def get_architecture_recommendations(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to queue architecture recommendation request: {str(e)}"
-        )
-
-
-# ==================== SIGNALR ENDPOINTS ====================
-
-class SignalRConnectionInfo(BaseModel):
-    """SignalR connection info response"""
-    url: str
-    accessToken: str
-
-
-class SignalRNegotiateRequest(BaseModel):
-    """Request model for SignalR negotiate"""
-    userId: str = Field(..., description="User ID for SignalR connection")
-
-
-def generate_signalr_token(hub_name: str, user_id: str) -> str:
-    """Generate SignalR access token as proper JWT using HMAC-SHA256"""
-    if not signalr_endpoint or not signalr_access_key:
-        raise ValueError("SignalR not configured")
-    
-    import time
-    
-    # Construct audience - must match SignalR service expectations exactly
-    base_endpoint = signalr_endpoint.rstrip('/')
-    audience = f"{base_endpoint}/client/?hub={hub_name}"
-    
-    # Token expiration (1 hour from now)
-    exp = int(time.time()) + 3600
-    iat = int(time.time())
-    
-    # JWT Header - Azure SignalR doesn't use kid
-    header = {
-        "typ": "JWT",
-        "alg": "HS256"
-    }
-    
-    # JWT Payload - Azure SignalR requires specific claims
-    payload = {
-        "aud": audience,
-        "exp": exp,
-        "iat": iat
-    }
-    
-    # Add user claim if provided
-    if user_id:
-        payload["nameid"] = user_id
-    
-    # Encode header and payload
-    def base64url_encode(data):
-        """Base64 URL-safe encoding without padding"""
-        encoded = base64.urlsafe_b64encode(
-            json.dumps(data, separators=(',', ':')).encode('utf-8')
-        ).rstrip(b'=').decode('utf-8')
-        return encoded
-    
-    encoded_header = base64url_encode(header)
-    encoded_payload = base64url_encode(payload)
-    
-    # Create signature base
-    signing_input = f"{encoded_header}.{encoded_payload}"
-    
-    # Sign with HMAC-SHA256 using the access key
-    try:
-        # Decode the base64-encoded access key
-        key_bytes = base64.b64decode(signalr_access_key)
-        
-        # Create HMAC signature
-        signature = hmac.new(
-            key_bytes,
-            signing_input.encode('utf-8'),
-            hashlib.sha256
-        ).digest()
-        
-        # Base64url encode the signature
-        encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
-    except Exception as e:
-        logger.error(f"Error signing token: {str(e)}")
-        raise
-    
-    # Construct JWT
-    jwt_token = f"{encoded_header}.{encoded_payload}.{encoded_signature}"
-    
-    return jwt_token
-
-
-@app.post("/api/signalr/negotiate")
-async def signalr_negotiate(
-    request: SignalRNegotiateRequest
-):
-    """SignalR negotiate endpoint for client connections"""
-    try:
-        if not signalr_endpoint or not signalr_access_key:
-            raise HTTPException(
-                status_code=503,
-                detail="SignalR Service is not configured"
-            )
-        
-        # Generate access token for the user
-        access_token = generate_signalr_token(SIGNALR_HUB_NAME, request.userId)
-        
-        # Construct client connection URL - must use the format SignalR expects
-        client_endpoint = f"{signalr_endpoint}/client/?hub={SIGNALR_HUB_NAME}"
-        
-        # Return response in Azure SignalR negotiate format
-        response = {
-            "accessToken": access_token,
-            "url": client_endpoint
-        }
-        
-        return response
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error negotiating SignalR connection: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to negotiate SignalR connection: {str(e)}"
-        )
-
-
-class SignalRMessage(BaseModel):
-    """SignalR message to send"""
-    target: str = Field(..., description="Target method name")
-    arguments: List[Any] = Field(..., description="Arguments to pass to the method")
-
-
-class SignalRSendRequest(BaseModel):
-    """Request to send a message via SignalR"""
-    userId: Optional[str] = Field(None, description="Send to specific user")
-    groupName: Optional[str] = Field(None, description="Send to specific group")
-    message: SignalRMessage
-
-
-async def send_signalr_message(
-    hub_name: str,
-    target: str,
-    arguments: List[Any],
-    user_id: Optional[str] = None,
-    group_name: Optional[str] = None
-) -> bool:
-    """Send a message via SignalR to users or groups"""
-    try:
-        if not signalr_endpoint or not signalr_access_key:
-            logger.warning("SignalR not configured, skipping message send")
-            return False
-        
-        # Construct API URL
-        if user_id:
-            url = f"{signalr_endpoint}/api/v1/hubs/{hub_name}/users/{user_id}"
-        elif group_name:
-            url = f"{signalr_endpoint}/api/v1/hubs/{hub_name}/groups/{group_name}"
-        else:
-            url = f"{signalr_endpoint}/api/v1/hubs/{hub_name}"
-        
-        # Generate server token (JWT for REST API)
-        import time
-        base_endpoint = signalr_endpoint.rstrip('/')
-        audience = f"{base_endpoint}/api/v1/hubs/{hub_name}"
-        
-        exp = int(time.time()) + 3600
-        iat = int(time.time())
-        
-        # JWT Header
-        header = {
-            "alg": "HS256",
-            "typ": "JWT"
-        }
-        
-        # JWT Payload - Azure SignalR requires specific claims for REST API
-        payload_data = {
-            "aud": audience,
-            "iat": iat,
-            "exp": exp,
-            "nbf": iat  # Not before time
-        }
-        
-        # Encode header and payload
-        def base64url_encode(data):
-            """Base64 URL-safe encoding without padding"""
-            return base64.urlsafe_b64encode(json.dumps(data, separators=(',', ':')).encode('utf-8')).rstrip(b'=').decode('utf-8')
-        
-        encoded_header = base64url_encode(header)
-        encoded_payload = base64url_encode(payload_data)
-        
-        # Create signature base
-        signing_input = f"{encoded_header}.{encoded_payload}"
-        
-        # Sign with HMAC-SHA256
-        key_bytes = base64.b64decode(signalr_access_key)
-        signature = hmac.new(key_bytes, signing_input.encode('utf-8'), hashlib.sha256).digest()
-        encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
-        
-        # Construct JWT
-        bearer_token = f"{encoded_header}.{encoded_payload}.{encoded_signature}"
-        
-        # Send message
-        headers = {
-            "Authorization": f"Bearer {bearer_token}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "target": target,
-            "arguments": arguments
-        }
-        
-        response = requests.post(url, json=data, headers=headers, timeout=10)
-        
-        if response.status_code == 202:
-            logger.info(f"SignalR message sent successfully to {user_id or group_name or 'all'}")
-            return True
-        else:
-            logger.error(f"Failed to send SignalR message: {response.status_code} - {response.text}")
-            return False
-    
-    except Exception as e:
-        logger.error(f"Error sending SignalR message: {str(e)}", exc_info=True)
-        return False
-
-
-@app.post("/api/signalr/send")
-async def signalr_send(
-    request: SignalRSendRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user)
-):
-    """Send a message via SignalR (for testing or manual triggers)"""
-    try:
-        success = await send_signalr_message(
-            hub_name=SIGNALR_HUB_NAME,
-            target=request.message.target,
-            arguments=request.message.arguments,
-            user_id=request.userId,
-            group_name=request.groupName
-        )
-        
-        if success:
-            return {"success": True, "message": "Message sent successfully"}
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to send SignalR message"
-            )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in SignalR send endpoint: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to send message: {str(e)}"
         )
 
 

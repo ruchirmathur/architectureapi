@@ -742,7 +742,6 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
     import time
     
     # Construct audience - must match SignalR service expectations exactly
-    # Azure SignalR expects: https://<name>.service.signalr.net/client/?hub=<hubname>
     base_endpoint = signalr_endpoint.rstrip('/')
     audience = f"{base_endpoint}/client/?hub={hub_name}"
     
@@ -750,28 +749,30 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
     exp = int(time.time()) + 3600
     iat = int(time.time())
     
-    # JWT Header
+    # JWT Header - Azure SignalR doesn't use kid
     header = {
-        "alg": "HS256",
-        "typ": "JWT"
+        "typ": "JWT",
+        "alg": "HS256"
     }
     
     # JWT Payload - Azure SignalR requires specific claims
     payload = {
         "aud": audience,
-        "iat": iat,
         "exp": exp,
-        "nbf": iat  # Not before time (same as issued at)
+        "iat": iat
     }
     
     # Add user claim if provided
     if user_id:
-        payload["sub"] = user_id
+        payload["nameid"] = user_id
     
     # Encode header and payload
     def base64url_encode(data):
         """Base64 URL-safe encoding without padding"""
-        return base64.urlsafe_b64encode(json.dumps(data, separators=(',', ':')).encode('utf-8')).rstrip(b'=').decode('utf-8')
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(data, separators=(',', ':')).encode('utf-8')
+        ).rstrip(b'=').decode('utf-8')
+        return encoded
     
     encoded_header = base64url_encode(header)
     encoded_payload = base64url_encode(payload)
@@ -781,26 +782,29 @@ def generate_signalr_token(hub_name: str, user_id: str) -> str:
     
     # Sign with HMAC-SHA256 using the access key
     try:
-        # The access key from connection string is already base64-encoded
+        # Decode the base64-encoded access key
         key_bytes = base64.b64decode(signalr_access_key)
-        logger.info(f"Signing with key of length: {len(key_bytes)} bytes")
-        signature = hmac.new(key_bytes, signing_input.encode('utf-8'), hashlib.sha256).digest()
+        
+        # Create HMAC signature
+        signature = hmac.new(
+            key_bytes,
+            signing_input.encode('utf-8'),
+            hashlib.sha256
+        ).digest()
+        
+        # Base64url encode the signature
         encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
     except Exception as e:
-        logger.error(f"Error signing token: {e}")
+        logger.error(f"Error signing token: {str(e)}")
         raise
     
     # Construct JWT
     jwt_token = f"{encoded_header}.{encoded_payload}.{encoded_signature}"
     
-    logger.info(f"Generated JWT token for user {user_id}")
-    logger.info(f"Token header: {encoded_header}")
-    logger.info(f"Token audience: {audience}")
-    
     return jwt_token
 
 
-@app.post("/api/signalr/negotiate", response_model=SignalRConnectionInfo)
+@app.post("/api/signalr/negotiate")
 async def signalr_negotiate(
     request: SignalRNegotiateRequest
 ):
@@ -815,15 +819,16 @@ async def signalr_negotiate(
         # Generate access token for the user
         access_token = generate_signalr_token(SIGNALR_HUB_NAME, request.userId)
         
-        # Construct client connection URL
-        connection_url = f"{signalr_endpoint}/client/?hub={SIGNALR_HUB_NAME}"
+        # Construct client connection URL - must use the format SignalR expects
+        client_endpoint = f"{signalr_endpoint}/client/?hub={SIGNALR_HUB_NAME}"
         
-        logger.info(f"SignalR connection negotiated for user: {request.userId}")
+        # Return response in Azure SignalR negotiate format
+        response = {
+            "accessToken": access_token,
+            "url": client_endpoint
+        }
         
-        return SignalRConnectionInfo(
-            url=connection_url,
-            accessToken=access_token
-        )
+        return response
     
     except HTTPException:
         raise

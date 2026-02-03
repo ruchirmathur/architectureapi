@@ -734,31 +734,56 @@ class SignalRNegotiateRequest(BaseModel):
 
 
 def generate_signalr_token(hub_name: str, user_id: str) -> str:
-    """Generate SignalR access token using HMAC"""
+    """Generate SignalR access token as proper JWT using HMAC-SHA256"""
     if not signalr_endpoint or not signalr_access_key:
         raise ValueError("SignalR not configured")
     
-    # Remove https:// and trailing slash
-    endpoint = signalr_endpoint.replace('https://', '').replace('http://', '').rstrip('/')
+    import time
     
-    # Construct audience
-    audience = f"{signalr_endpoint}/client/?hub={hub_name}"
+    # Construct audience (base endpoint without trailing slash)
+    base_endpoint = signalr_endpoint.rstrip('/')
+    audience = f"{base_endpoint}/client/?hub={hub_name}"
     
     # Token expiration (1 hour from now)
-    import time
     exp = int(time.time()) + 3600
+    iat = int(time.time())
     
-    # Construct payload
-    payload = f"{audience}\n{exp}"
+    # JWT Header
+    header = {
+        "alg": "HS256",
+        "typ": "JWT"
+    }
+    
+    # JWT Payload
+    payload = {
+        "aud": audience,
+        "iat": iat,
+        "exp": exp
+    }
+    
+    # Add user claim if provided
+    if user_id:
+        payload["sub"] = user_id
+    
+    # Encode header and payload
+    def base64url_encode(data):
+        """Base64 URL-safe encoding without padding"""
+        return base64.urlsafe_b64encode(json.dumps(data, separators=(',', ':')).encode('utf-8')).rstrip(b'=').decode('utf-8')
+    
+    encoded_header = base64url_encode(header)
+    encoded_payload = base64url_encode(payload)
+    
+    # Create signature base
+    signing_input = f"{encoded_header}.{encoded_payload}"
     
     # Sign with HMAC-SHA256
     key_bytes = base64.b64decode(signalr_access_key)
-    signature = hmac.new(key_bytes, payload.encode('utf-8'), hashlib.sha256).digest()
-    encoded_signature = base64.b64encode(signature).decode('utf-8')
+    signature = hmac.new(key_bytes, signing_input.encode('utf-8'), hashlib.sha256).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
     
-    # Construct token
-    token = f"{audience}\n{exp}\n{encoded_signature}"
-    return base64.b64encode(token.encode('utf-8')).decode('utf-8')
+    # Construct JWT
+    jwt_token = f"{encoded_header}.{encoded_payload}.{encoded_signature}"
+    return jwt_token
 
 
 @app.post("/api/signalr/negotiate", response_model=SignalRConnectionInfo)
@@ -830,15 +855,45 @@ async def send_signalr_message(
         else:
             url = f"{signalr_endpoint}/api/v1/hubs/{hub_name}"
         
-        # Generate server token
+        # Generate server token (JWT for REST API)
         import time
+        base_endpoint = signalr_endpoint.rstrip('/')
+        audience = f"{base_endpoint}/api/v1/hubs/{hub_name}"
+        
         exp = int(time.time()) + 3600
-        payload = f"{signalr_endpoint}/api/v1/hubs/{hub_name}\n{exp}"
+        iat = int(time.time())
+        
+        # JWT Header
+        header = {
+            "alg": "HS256",
+            "typ": "JWT"
+        }
+        
+        # JWT Payload
+        payload_data = {
+            "aud": audience,
+            "iat": iat,
+            "exp": exp
+        }
+        
+        # Encode header and payload
+        def base64url_encode(data):
+            """Base64 URL-safe encoding without padding"""
+            return base64.urlsafe_b64encode(json.dumps(data, separators=(',', ':')).encode('utf-8')).rstrip(b'=').decode('utf-8')
+        
+        encoded_header = base64url_encode(header)
+        encoded_payload = base64url_encode(payload_data)
+        
+        # Create signature base
+        signing_input = f"{encoded_header}.{encoded_payload}"
+        
+        # Sign with HMAC-SHA256
         key_bytes = base64.b64decode(signalr_access_key)
-        signature = hmac.new(key_bytes, payload.encode('utf-8'), hashlib.sha256).digest()
-        encoded_signature = base64.b64encode(signature).decode('utf-8')
-        token_payload = f"{signalr_endpoint}/api/v1/hubs/{hub_name}\n{exp}\n{encoded_signature}"
-        bearer_token = base64.b64encode(token_payload.encode('utf-8')).decode('utf-8')
+        signature = hmac.new(key_bytes, signing_input.encode('utf-8'), hashlib.sha256).digest()
+        encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
+        
+        # Construct JWT
+        bearer_token = f"{encoded_header}.{encoded_payload}.{encoded_signature}"
         
         # Send message
         headers = {

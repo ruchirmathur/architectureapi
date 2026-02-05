@@ -129,6 +129,7 @@ class ArchitectureRecommendationRequest(BaseModel):
     sessionId: str = Field(..., description="Session ID")
     applicationName: str = Field(..., description="Application Name")
     overview: str = Field(..., description="Comprehensive application overview for architecture analysis", max_length=4000)
+    userId: Optional[str] = Field(None, description="User ID")
 
 
 # Architecture recommendation response models
@@ -637,8 +638,12 @@ async def get_architecture_recommendations(
         try:
             sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
             async with sender:
+                # Create message payload with userId from authenticated user
+                message_data = request.model_dump()
+                message_data["userId"] = current_user.user_id
+                
                 message = ServiceBusMessage(
-                    body=json.dumps(request.model_dump()),
+                    body=json.dumps(message_data),
                     content_type="application/json"
                 )
                 await sender.send_messages(message)

@@ -633,9 +633,8 @@ async def get_architecture_recommendations(
         # Use userId from request if provided, otherwise use authenticated user
         user_id = request.userId or current_user.user_id
         
-        # Check if a recommendation already exists for this user and application
+        # Check if a recommendation already exists for this application
         existing_recommendation = await db.get_recommendation(
-           
             application_name=request.applicationName,
             tenant_id=request.tenantId
         )

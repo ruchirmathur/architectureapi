@@ -256,7 +256,7 @@ class CosmosDBService:
             logger.error(f"Error deleting requirement: {str(e)}", exc_info=True)
             raise
     
-    async def get_recommendation(self, user_id: str, application_name: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+    async def get_recommendation(self, application_name: str, tenant_id: str) -> Optional[Dict[str, Any]]:
         """Get an existing recommendation by applicationName and tenant"""
         try:
             query = """

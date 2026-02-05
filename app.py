@@ -10,6 +10,10 @@ from contextlib import asynccontextmanager
 import logging
 import os
 import json
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 from openai import OpenAI
 from azure.servicebus.aio import ServiceBusClient
 from azure.servicebus import ServiceBusMessage

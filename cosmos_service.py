@@ -269,11 +269,10 @@ class CosmosDBService:
                 {"name": "@applicationName", "value": application_name}
             ]
             
-            # Enable cross-partition query for composite partition key container
+            # Cross-partition query (no partition_key specified for composite keys)
             items = self.recommendations_container.query_items(
                 query=query,
-                parameters=parameters,
-                enable_cross_partition_query=True
+                parameters=parameters
             )
             
             async for item in items:

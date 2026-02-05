@@ -257,24 +257,23 @@ class CosmosDBService:
             raise
     
     async def get_recommendation(self, user_id: str, application_name: str, tenant_id: str) -> Optional[Dict[str, Any]]:
-        """Get an existing recommendation by userId, applicationName, and tenant"""
+        """Get an existing recommendation by applicationName and tenant"""
         try:
             query = """
             SELECT * FROM c 
             WHERE c.tenantId = @tenantId 
-            AND c.userId = @userId 
             AND c.applicationName = @applicationName
             """
             parameters = [
                 {"name": "@tenantId", "value": tenant_id},
-                {"name": "@userId", "value": user_id},
                 {"name": "@applicationName", "value": application_name}
             ]
             
+            # Composite partition key: [tenantId, applicationName]
             items = self.recommendations_container.query_items(
                 query=query,
                 parameters=parameters,
-                partition_key=tenant_id
+                partition_key=[tenant_id, application_name]
             )
             
             async for item in items:

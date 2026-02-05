@@ -32,6 +32,7 @@ COSMOS_KEY = os.getenv("COSMOS_KEY")
 COSMOS_DATABASE_NAME = os.getenv("COSMOS_DATABASE_NAME", "architecture")
 COSMOS_REQUIREMENTS_CONTAINER = os.getenv("COSMOS_REQUIREMENTS_CONTAINER", "requirements")
 COSMOS_USERS_CONTAINER = os.getenv("COSMOS_USERS_CONTAINER", "users")
+COSMOS_RECOMMENDATIONS_CONTAINER = os.getenv("COSMOS_RECOMMENDATIONS_CONTAINER", "recommendations")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
 # Azure Service Bus Configuration
@@ -296,7 +297,8 @@ async def lifespan(app: FastAPI):
         key=COSMOS_KEY,
         database_name=COSMOS_DATABASE_NAME,
         requirements_container=COSMOS_REQUIREMENTS_CONTAINER,
-        users_container=COSMOS_USERS_CONTAINER
+        users_container=COSMOS_USERS_CONTAINER,
+        recommendations_container=COSMOS_RECOMMENDATIONS_CONTAINER
     )
     
     try:
@@ -617,15 +619,47 @@ async def list_requirements(
 @app.post("/api/architecture/recommendations", response_model=ArchitectureRecommendationResponse)
 async def get_architecture_recommendations(
     request: ArchitectureRecommendationRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user)
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: CosmosDBService = Depends(get_cosmos_service)
 ):
     """
-    Queue architecture recommendation request for asynchronous processing
+    Get architecture recommendations - checks for existing recommendations first,
+    otherwise queues request for asynchronous processing
     
-    This endpoint accepts the application overview and queues it for processing.
-    Returns immediately with a success response.
+    This endpoint first checks if a recommendation already exists for the user and application.
+    If found, returns it immediately. Otherwise, queues the request for processing.
     """
     try:
+        # Use userId from request if provided, otherwise use authenticated user
+        user_id = request.userId or current_user.user_id
+        
+        # Check if a recommendation already exists for this user and application
+        existing_recommendation = await db.get_recommendation(
+            user_id=user_id,
+            application_name=request.applicationName,
+            tenant_id=request.tenantId
+        )
+        
+        if existing_recommendation:
+            # Recommendation found - return it directly
+            logger.info(f"Found existing recommendation for user {user_id}, app {request.applicationName}")
+            
+            # Extract architectures from the stored recommendation
+            # The document stores architectures in 'architectureRecommendations' field
+            architectures_data = existing_recommendation.get("architectureRecommendations", [])
+            architectures = [Architecture(**arch) for arch in architectures_data] if architectures_data else None
+            
+            return ArchitectureRecommendationResponse(
+                success=True,
+                message="Retrieved existing architecture recommendation",
+                tenantId=request.tenantId,
+                sessionId=request.sessionId,
+                architectures=architectures
+            )
+        
+        # No existing recommendation found - queue for processing
+        logger.info(f"No existing recommendation found for user {user_id}, app {request.applicationName}. Queuing request.")
+        
         # Validate Service Bus client is available
         if not service_bus_client:
             logger.error("Service Bus client not initialized")
@@ -638,9 +672,9 @@ async def get_architecture_recommendations(
         try:
             sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
             async with sender:
-                # Create message payload with userId from authenticated user
+                # Create message payload with userId
                 message_data = request.model_dump()
-                message_data["userId"] = current_user.user_id
+                message_data["userId"] = user_id
                 
                 message = ServiceBusMessage(
                     body=json.dumps(message_data),
@@ -671,10 +705,10 @@ async def get_architecture_recommendations(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error queueing architecture recommendation request: {str(e)}", exc_info=True)
+        logger.error(f"Error processing architecture recommendation request: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to queue architecture recommendation request: {str(e)}"
+            detail=f"Failed to process architecture recommendation request: {str(e)}"
         )
 
 

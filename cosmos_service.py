@@ -15,7 +15,8 @@ class CosmosDBService:
     """Service for interacting with Cosmos DB"""
     
     def __init__(self, endpoint: str, key: str, database_name: str, 
-                 requirements_container: str, users_container: str):
+                 requirements_container: str, users_container: str,
+                 recommendations_container: str = "recommendations"):
         """Initialize Cosmos DB client and get references to existing containers"""
         try:
             # Create Cosmos client
@@ -30,6 +31,9 @@ class CosmosDBService:
             )
             self.users_container = self.database.get_container_client(
                 container=users_container
+            )
+            self.recommendations_container = self.database.get_container_client(
+                container=recommendations_container
             )
             
         except Exception as e:
@@ -250,4 +254,59 @@ class CosmosDBService:
             return False
         except Exception as e:
             logger.error(f"Error deleting requirement: {str(e)}", exc_info=True)
+            raise
+    
+    async def get_recommendation(self, user_id: str, application_name: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """Get an existing recommendation by userId, applicationName, and tenant"""
+        try:
+            query = """
+            SELECT * FROM c 
+            WHERE c.tenantId = @tenantId 
+            AND c.userId = @userId 
+            AND c.applicationName = @applicationName
+            """
+            parameters = [
+                {"name": "@tenantId", "value": tenant_id},
+                {"name": "@userId", "value": user_id},
+                {"name": "@applicationName", "value": application_name}
+            ]
+            
+            items = self.recommendations_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=tenant_id
+            )
+            
+            async for item in items:
+                return item  # Return first match
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting recommendation: {str(e)}", exc_info=True)
+            return None
+    
+    async def create_recommendation(self, recommendation_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new recommendation in Cosmos DB"""
+        try:
+            # Generate unique ID if not present
+            if "id" not in recommendation_data:
+                recommendation_data["id"] = str(uuid.uuid4())
+            
+            # Add timestamps
+            current_time = datetime.utcnow().isoformat() + "Z"
+            recommendation_data["createdAt"] = current_time
+            recommendation_data["updatedAt"] = current_time
+            
+            # Insert into Cosmos DB
+            created_item = await self.recommendations_container.create_item(
+                body=recommendation_data,
+                enable_automatic_id_generation=False
+            )
+            
+            logger.info(f"Created recommendation: {created_item['id']}")
+            return created_item
+            
+        except Exception as e:
+            logger.error(f"Error creating recommendation: {str(e)}", exc_info=True)
             raise

@@ -135,16 +135,34 @@ class ArchitectureRecommendationRequest(BaseModel):
     applicationName: str = Field(..., description="Application Name")
     overview: str = Field(..., description="Comprehensive application overview for architecture analysis", max_length=4000)
     userId: Optional[str] = Field(None, description="User ID")
+    applicationType: Optional[str] = Field(None, description="Application type (e.g., PWA, SPA, Mobile)")
+    domain: Optional[List[str]] = Field(default=[], description="Domain areas (e.g., Healthcare)")
+    industry: Optional[List[str]] = Field(default=[], description="Industry sectors")
+    coreUseCases: Optional[List[str]] = Field(default=[], description="Core use cases")
+    useCases: Optional[List[str]] = Field(default=[], description="Use cases")
+    features: Optional[str] = Field(default="", description="Comma-separated features string")
+    featuresList: Optional[List[str]] = Field(default=[], description="Features as a list")
+    nfrs: Optional[NFRs] = Field(default_factory=NFRs, description="Non-functional requirements")
+    performance: Optional[str] = Field(default="", description="Performance requirements")
+    reliability: Optional[str] = Field(default="", description="Reliability requirements")
+    dataProfile: Optional[str] = Field(default="", description="Data profile description")
+    dataTypes: Optional[List[str]] = Field(default=[], description="Types of data managed")
+    userRoles: Optional[List[str]] = Field(default=[], description="User roles")
+    userTypes: Optional[List[str]] = Field(default=[], description="User types")
+    security: Optional[List[str]] = Field(default=[], description="Security requirements")
+    securityRequirements: Optional[List[str]] = Field(default=[], description="Security requirements (clean)")
+    integrations: Optional[str] = Field(default="", description="Integrations description")
+    integrationsList: Optional[List[str]] = Field(default=[], description="Integrations as a list")
 
 
 # Architecture recommendation response models
 class Metrics(BaseModel):
     """All architecture metrics in one place"""
-    latency: List[int] = Field(default=[], description="[min, max] in ms")
-    throughput: List[int] = Field(default=[], description="[min, max] requests/sec")
+    latency: List[float] = Field(default=[], description="[min, max] in ms")
+    throughput: List[float] = Field(default=[], description="[min, max] requests/sec")
     availability: float = Field(default=0, description="Availability percentage")
     autoscaling: str = Field(default="", description="Yes/No/Limited")
-    cost: List[int] = Field(default=[], description="[min, max] monthly USD")
+    cost: List[float] = Field(default=[], description="[min, max] monthly USD")
     scalability: int = Field(default=5, ge=1, le=10)
     reliability: int = Field(default=5, ge=1, le=10)
     maintainability: int = Field(default=5, ge=1, le=10)
@@ -675,9 +693,16 @@ async def get_architecture_recommendations(
         try:
             sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
             async with sender:
-                # Create message payload with userId
+                # Create message payload with all fields + resolved userId
                 message_data = request.model_dump()
                 message_data["userId"] = user_id
+                
+                # Convert NFRs from nested object to dict if present
+                if message_data.get("nfrs") and hasattr(message_data["nfrs"], "__dict__"):
+                    message_data["nfrs"] = dict(message_data["nfrs"])
+                
+                logger.info(f"Service Bus message payload keys: {list(message_data.keys())}")
+                logger.info(f"Service Bus message payload: {json.dumps(message_data, indent=2)}")
                 
                 message = ServiceBusMessage(
                     body=json.dumps(message_data),

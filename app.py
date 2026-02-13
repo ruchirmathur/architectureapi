@@ -665,18 +665,44 @@ async def get_architecture_recommendations(
         if existing_recommendation:
             # Recommendation found - return it directly
             logger.info(f"Found existing recommendation for user {user_id}, app {request.applicationName}")
+            logger.info(f"Recommendation keys: {list(existing_recommendation.keys())}")
             
             # Extract architectures from the stored recommendation
             # The document stores architectures in 'architectureRecommendations' field
             architectures_data = existing_recommendation.get("architectureRecommendations", [])
             architectures = [Architecture(**arch) for arch in architectures_data] if architectures_data else None
             
-            # Extract features from requestMetadata
+            # Extract features - try multiple locations
+            features = []
+            
+            # Try requestMetadata.features first
             request_metadata = existing_recommendation.get("requestMetadata", {})
-            features = request_metadata.get("features", [])
+            if request_metadata and request_metadata.get("features"):
+                features = request_metadata.get("features", [])
+                logger.info(f"Found features in requestMetadata: {features}")
+            
+            # Fallback: try featuresList at root level
+            if not features and existing_recommendation.get("featuresList"):
+                features = existing_recommendation.get("featuresList", [])
+                logger.info(f"Found features in featuresList: {features}")
+            
+            # Fallback: try features at root level
+            if not features and existing_recommendation.get("features"):
+                features = existing_recommendation.get("features", [])
+                logger.info(f"Found features at root: {features}")
+            
+            # Final fallback: use features from the incoming request
+            if not features:
+                features = request.featuresList if request.featuresList else (
+                    [f.strip() for f in request.features.split(',') if f.strip()] if request.features else []
+                )
+                logger.info(f"Using features from request: {features}")
+            
             # Ensure features is a list
             if isinstance(features, str):
                 features = [f.strip() for f in features.split(',') if f.strip()]
+            
+            logger.info(f"Final features list: {features}")
             
             return ArchitectureRecommendationResponse(
                 success=True,

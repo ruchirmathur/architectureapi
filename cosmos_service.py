@@ -16,7 +16,8 @@ class CosmosDBService:
     
     def __init__(self, endpoint: str, key: str, database_name: str, 
                  requirements_container: str, users_container: str,
-                 recommendations_container: str = "recommendations"):
+                 recommendations_container: str = "recommendations",
+                 designs_container: str = "designs"):
         """Initialize Cosmos DB client and get references to existing containers"""
         try:
             # Create Cosmos client
@@ -34,6 +35,9 @@ class CosmosDBService:
             )
             self.recommendations_container = self.database.get_container_client(
                 container=recommendations_container
+            )
+            self.designs_container = self.database.get_container_client(
+                container=designs_container
             )
             
         except Exception as e:
@@ -308,3 +312,79 @@ class CosmosDBService:
         except Exception as e:
             logger.error(f"Error creating recommendation: {str(e)}", exc_info=True)
             raise
+
+    async def create_design(self, design_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new design (LLD) in Cosmos DB"""
+        try:
+            # Generate unique ID if not present
+            if "id" not in design_data:
+                design_data["id"] = str(uuid.uuid4())
+            
+            # Add timestamps
+            current_time = datetime.utcnow().isoformat() + "Z"
+            design_data["createdAt"] = current_time
+            design_data["updatedAt"] = current_time
+            
+            # Insert into Cosmos DB
+            created_item = await self.designs_container.create_item(
+                body=design_data,
+                enable_automatic_id_generation=False
+            )
+            
+            logger.info(f"Created design: {created_item['id']}")
+            return created_item
+            
+        except Exception as e:
+            logger.error(f"Error creating design: {str(e)}", exc_info=True)
+            raise
+
+    async def get_design(self, design_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """Get a design by ID and tenant"""
+        try:
+            query = "SELECT * FROM c WHERE c.id = @id AND c.tenantId = @tenantId"
+            parameters = [
+                {"name": "@id", "value": design_id},
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+            
+            items = self.designs_container.query_items(
+                query=query,
+                parameters=parameters,
+                max_item_count=1
+            )
+            
+            async for item in items:
+                logger.info(f"Retrieved design document size: ~{len(str(item))} chars")
+                return item
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting design: {str(e)}", exc_info=True)
+            return None
+
+    async def get_design_by_architecture(self, architecture_id: str, tenant_id: str, application_name: str = None) -> Optional[Dict[str, Any]]:
+        """Get a design by architectureId, tenantId, and optionally applicationName"""
+        try:
+            query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.applicationName = @applicationName AND c.type = 'lowLevelDesign' ORDER BY c.createdAt DESC"
+            parameters = [
+                {"name": "@architectureId", "value": architecture_id},
+                {"name": "@tenantId", "value": tenant_id},
+                {"name": "@applicationName", "value": application_name}
+            ]
+            
+            items = self.designs_container.query_items(
+                query=query,
+                parameters=parameters,
+                max_item_count=1
+            )
+            
+            async for item in items:
+                logger.info(f"Retrieved design document size: ~{len(str(item))} chars")
+                return item  # Return the most recent one
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting design by architecture: {str(e)}", exc_info=True)
+            return None

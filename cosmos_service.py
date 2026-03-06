@@ -363,6 +363,10 @@ class CosmosDBService:
             logger.error(f"Error getting design: {str(e)}", exc_info=True)
             return None
 
+    async def get_design_by_architecture_id(self, architecture_id: str, tenant_id: str, application_name: str = None) -> Optional[Dict[str, Any]]:
+        """Alias for get_design_by_architecture for backwards compatibility"""
+        return await self.get_design_by_architecture(architecture_id, tenant_id, application_name)
+
     async def get_design_by_architecture(self, architecture_id: str, tenant_id: str, application_name: str = None) -> Optional[Dict[str, Any]]:
         """Get a design by architectureId, tenantId, and optionally applicationName"""
         try:

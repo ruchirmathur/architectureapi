@@ -1546,7 +1546,7 @@ async def get_code_recommendations(
         
         # Send message to Service Bus with proper error handling
         try:
-            sender = service_bus_client.get_queue_sender(queue_name=AZURE_SERVICE_BUS_CODE_QUEUE)
+            sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
             async with sender:
                 # Create message payload with all fields + resolved userId
                 message_data = request.model_dump()

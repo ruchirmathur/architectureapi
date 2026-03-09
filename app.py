@@ -1400,27 +1400,93 @@ async def get_lld_recommendations(
         # Check if LLD already exists for this application/architecture
         if architecture_id:
             try:
-                existing_lld = await db.get_design_by_architecture_id(
+                logger.info(f"Looking for existing LLD with architectureId={architecture_id}, tenantId={request.tenantId}, applicationName={request.applicationName}")
+                
+                # Debug: List all designs for this tenant to see what's available
+                debug_designs = await db.list_designs_debug(tenant_id=request.tenantId, limit=10)
+                logger.info(f"Debug: Found {len(debug_designs)} total designs for tenant {request.tenantId}")
+                
+                existing_lld = await db.get_design_by_architecture(
                     architecture_id=architecture_id,
                     tenant_id=request.tenantId,
                     application_name=request.applicationName
                 )
                 
-                if existing_lld and existing_lld.get('type') == 'lowLevelDesign':
-                    logger.info(f"Found existing LLD for user {user_id}, architecture {architecture_id}")
+                if existing_lld:
+                    logger.info(f"Found existing LLD: designId={existing_lld.get('designId')}, type={existing_lld.get('type')}")
                     
-                    lld_data = existing_lld.get('lldResponse', {})
-                    features = lld_data.get('features', [])
+                    # Verify it's a lowLevelDesign type
+                    if existing_lld.get('type') == 'lowLevelDesign':
+                        logger.info(f"Returning existing LLD for user {user_id}, architecture {architecture_id}")
+                        
+                        # Extract LLD response data
+                        lld_data = existing_lld.get('lldResponse', {})
+                        if not lld_data:
+                            logger.warning(f"LLD document found but lldResponse is empty or missing")
+                            lld_data = {"error": "LLD data is empty"}
+                        
+                        # Extract features from multiple possible locations
+                        features = []
+                        if lld_data.get('features'):
+                            features = [f.get('name', 'Unknown') for f in lld_data.get('features', [])]
+                        elif existing_lld.get('generatedFeatures'):
+                            features = existing_lld.get('generatedFeatures', [])
+                        elif existing_lld.get('features'):
+                            features = existing_lld.get('features', [])
+                        
+                        logger.info(f"Extracted {len(features)} features from LLD: {features}")
+                        
+                        return LLDResponse(
+                            success=True,
+                            designId=existing_lld.get('designId'),
+                            featureCount=len(features),
+                            lld=lld_data,
+                            error=None
+                        )
+                    else:
+                        logger.warning(f"Found design but type is '{existing_lld.get('type')}', not 'lowLevelDesign'")
+                else:
+                    logger.info(f"No LLD found for architectureId={architecture_id}")
                     
-                    return LLDResponse(
-                        success=True,
-                        designId=existing_lld.get('designId'),
-                        featureCount=len(features),
-                        lld=lld_data,
-                        error=None
+                    # Try flexible fallback query without applicationName requirement
+                    logger.info(f"Trying flexible fallback query without applicationName requirement")
+                    existing_lld = await db.get_design_by_architecture_flexible(
+                        architecture_id=architecture_id,
+                        tenant_id=request.tenantId
                     )
+                    
+                    if existing_lld and existing_lld.get('type') == 'lowLevelDesign':
+                        logger.info(f"Found LLD via flexible query: designId={existing_lld.get('designId')}")
+                        
+                        # Extract LLD response data
+                        lld_data = existing_lld.get('lldResponse', {})
+                        if not lld_data:
+                            logger.warning(f"LLD document found via flexible query but lldResponse is empty")
+                            lld_data = {"error": "LLD data is empty"}
+                        
+                        # Extract features from multiple possible locations
+                        features = []
+                        if lld_data.get('features'):
+                            features = [f.get('name', 'Unknown') for f in lld_data.get('features', [])]
+                        elif existing_lld.get('generatedFeatures'):
+                            features = existing_lld.get('generatedFeatures', [])
+                        elif existing_lld.get('features'):
+                            features = existing_lld.get('features', [])
+                        
+                        logger.info(f"Extracted {len(features)} features from flexible LLD query: {features}")
+                        
+                        return LLDResponse(
+                            success=True,
+                            designId=existing_lld.get('designId'),
+                            featureCount=len(features),
+                            lld=lld_data,
+                            error=None
+                        )
+                    else:
+                        logger.info(f"No LLD found via flexible query either")
+                    
             except Exception as e:
-                logger.warning(f"Error checking for existing LLD: {str(e)}")
+                logger.error(f"Error checking for existing LLD: {str(e)}", exc_info=True)
         
         # No existing LLD found - queue for processing
         logger.info(f"No existing LLD found for user {user_id}, app {request.applicationName}. Queuing request.")

@@ -341,11 +341,16 @@ class CosmosDBService:
     async def get_design(self, design_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
         """Get a design by ID and tenant"""
         try:
+            logger.info(f"Querying design by ID: designId={design_id}, tenantId={tenant_id}")
+            
             query = "SELECT * FROM c WHERE c.id = @id AND c.tenantId = @tenantId"
             parameters = [
                 {"name": "@id", "value": design_id},
                 {"name": "@tenantId", "value": tenant_id}
             ]
+            
+            logger.info(f"Executing query: {query}")
+            logger.info(f"Query parameters: {parameters}")
             
             items = self.designs_container.query_items(
                 query=query,
@@ -354,9 +359,10 @@ class CosmosDBService:
             )
             
             async for item in items:
-                logger.info(f"Retrieved design document size: ~{len(str(item))} chars")
+                logger.info(f"Retrieved design: designId={item.get('designId')}, type={item.get('type')}, size=~{len(str(item))} chars")
                 return item
             
+            logger.warning(f"No design found for designId={design_id}, tenantId={tenant_id}")
             return None
             
         except Exception as e:
@@ -365,17 +371,32 @@ class CosmosDBService:
 
     async def get_design_by_architecture_id(self, architecture_id: str, tenant_id: str, application_name: str = None) -> Optional[Dict[str, Any]]:
         """Alias for get_design_by_architecture for backwards compatibility"""
+        logger.info(f"get_design_by_architecture_id called with: architectureId={architecture_id}, tenantId={tenant_id}, applicationName={application_name}")
         return await self.get_design_by_architecture(architecture_id, tenant_id, application_name)
 
     async def get_design_by_architecture(self, architecture_id: str, tenant_id: str, application_name: str = None) -> Optional[Dict[str, Any]]:
         """Get a design by architectureId, tenantId, and optionally applicationName"""
         try:
-            query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.applicationName = @applicationName AND c.type = 'lowLevelDesign' ORDER BY c.createdAt DESC"
-            parameters = [
-                {"name": "@architectureId", "value": architecture_id},
-                {"name": "@tenantId", "value": tenant_id},
-                {"name": "@applicationName", "value": application_name}
-            ]
+            logger.info(f"Querying LLD: architectureId={architecture_id}, tenantId={tenant_id}, applicationName={application_name}")
+            
+            # Build query dynamically based on available parameters
+            if application_name:
+                query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.applicationName = @applicationName AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
+                parameters = [
+                    {"name": "@architectureId", "value": architecture_id},
+                    {"name": "@tenantId", "value": tenant_id},
+                    {"name": "@applicationName", "value": application_name}
+                ]
+            else:
+                # Fallback: query without applicationName if not provided
+                query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
+                parameters = [
+                    {"name": "@architectureId", "value": architecture_id},
+                    {"name": "@tenantId", "value": tenant_id}
+                ]
+            
+            logger.info(f"Executing query: {query}")
+            logger.info(f"Query parameters: {parameters}")
             
             items = self.designs_container.query_items(
                 query=query,
@@ -384,11 +405,78 @@ class CosmosDBService:
             )
             
             async for item in items:
-                logger.info(f"Retrieved design document size: ~{len(str(item))} chars")
+                logger.info(f"Retrieved LLD design: designId={item.get('designId')}, architectureId={item.get('architectureId')}, size=~{len(str(item))} chars")
                 return item  # Return the most recent one
             
+            logger.warning(f"No LLD design found for architectureId={architecture_id}, tenantId={tenant_id}, applicationName={application_name}")
             return None
             
         except Exception as e:
             logger.error(f"Error getting design by architecture: {str(e)}", exc_info=True)
             return None
+
+    async def get_design_by_architecture_flexible(self, architecture_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a design by architectureId and tenantId only (no applicationName requirement).
+        This is a fallback method when exact applicationName match fails.
+        """
+        try:
+            query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
+            parameters = [
+                {"name": "@architectureId", "value": architecture_id},
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+            
+            logger.info(f"Flexible LLD query: {query}")
+            logger.info(f"Parameters: {parameters}")
+            
+            items = self.designs_container.query_items(
+                query=query,
+                parameters=parameters,
+                max_item_count=1
+            )
+            
+            async for item in items:
+                logger.info(f"Found LLD via flexible query: designId={item.get('designId')}, applicationName={item.get('applicationName')}")
+                return item
+            
+            logger.info(f"No LLD found via flexible query for architectureId={architecture_id}, tenantId={tenant_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in flexible design query: {str(e)}", exc_info=True)
+            return None
+
+    async def list_designs_debug(self, tenant_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Debug method to list designs for a tenant to help diagnose query issues.
+        Returns basic info about designs in the container.
+        """
+        try:
+            query = "SELECT c.id, c.designId, c.architectureId, c.tenantId, c.applicationName, c.type, c._ts FROM c WHERE c.tenantId = @tenantId ORDER BY c._ts DESC"
+            parameters = [
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+            
+            logger.info(f"Debug query: {query}")
+            logger.info(f"Parameters: {parameters}")
+            
+            items = self.designs_container.query_items(
+                query=query,
+                parameters=parameters,
+                max_item_count=limit
+            )
+            
+            results = []
+            async for item in items:
+                results.append(item)
+            
+            logger.info(f"Found {len(results)} designs for tenant {tenant_id}")
+            for design in results:
+                logger.info(f"Design: id={design.get('id')}, designId={design.get('designId')}, architectureId={design.get('architectureId')}, applicationName={design.get('applicationName')}, type={design.get('type')}")
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error listing designs for debug: {str(e)}", exc_info=True)
+            return []

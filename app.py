@@ -2002,7 +2002,7 @@ MANDATORY REQUIREMENTS FOR EACH ARCHITECTURE:
 
 For EACH architecture recommendation, provide:
 
-1. A unique identifier (id) in the format "arch-X" where X is a number
+1. A unique identifier (id) in the format "arch-{{uuid}}" using a random 8-character UUID
 2. An icon name (e.g., "layers", "hub", "cloud", "microchip")
 3. A clear, specific name that reflects the pattern AND the use case (not just generic pattern names)
 4. A comprehensive description (3-4 DETAILED paragraphs) that MUST include:
@@ -2122,7 +2122,7 @@ Return the response as a valid JSON object with the following structure:
 {{
   "architectures": [
     {{
-      "id": "arch-1",
+      "id": "arch-{{8_char_uuid}}",
       "icon": "icon-name",
       "name": "Architecture Pattern Name tailored to {industry_str} {core_use_cases_str}",
       "description": "Detailed description explaining HOW each feature is implemented...",
@@ -2259,7 +2259,7 @@ def parse_openai_architectures(response_json: Dict[str, Any]) -> List[Architectu
     for idx, arch_data in enumerate(architectures_data):
         try:
             # Ensure required fields have defaults
-            arch_data.setdefault("id", f"arch-{idx + 1}")
+            arch_data.setdefault("id", f"arch-{str(uuid4())[:8]}")
             arch_data.setdefault("icon", "architecture")
             arch_data.setdefault("name", f"Architecture {idx + 1}")
             arch_data.setdefault("description", "")

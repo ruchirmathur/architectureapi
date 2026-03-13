@@ -423,10 +423,14 @@ class LLDResponse(BaseModel):
 
 class CodeGenerationRequest(BaseModel):
     """Request model for generating code from LLD"""
-    success: bool
-    designId: str = Field(..., description="Design identifier")
-    featureCount: int = Field(..., description="Number of features to generate code for")
-    lld: Dict[str, Any] = Field(..., description="Low Level Design specification")
+    tenantId: str = Field(default="default", description="Tenant ID")
+    applicationName: str = Field(default="Application", description="Application name")
+    sessionId: str = Field(default="default", description="Session ID")
+    userId: Optional[str] = Field(default=None, description="User ID")
+    designId: Optional[str] = Field(default=None, description="Design identifier")
+    featureCount: Optional[int] = Field(default=None, description="Number of features to generate code for")
+    lld: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Low Level Design specification")
+    architecture: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Architecture object")
     error: Optional[str] = None
 
 
@@ -1560,15 +1564,17 @@ async def get_code_recommendations(
     If found, returns it immediately. Otherwise, queues the request for processing.
     """
     try:
-        # Use current user as user identifier
-        user_id = current_user.user_id
+        # Use userId from request if provided, otherwise use authenticated user
+        user_id = request.userId or current_user.user_id
         
         # Check if generated code already exists for this design
         if request.designId:
             try:
+                logger.info(f"Looking for existing code with designId={request.designId}, tenantId={request.tenantId}")
+                
                 existing_code = await db.get_generated_code_by_design_id(
                     design_id=request.designId,
-                    tenant_id=getattr(request, 'tenantId', 'default')
+                    tenant_id=request.tenantId
                 )
                 
                 if existing_code:
@@ -1584,6 +1590,8 @@ async def get_code_recommendations(
                     # Convert to proper models
                     files = [GeneratedFile(path=f.get('path', ''), content=f.get('content', '')) for f in generated_files]
                     
+                    logger.info(f"Returning existing generated code with {len(files)} files for user {user_id}")
+                    
                     return CodeGenerationResponse(
                         success=True,
                         message=f"Retrieved existing generated code with {len(files)} files",
@@ -1596,8 +1604,10 @@ async def get_code_recommendations(
                         instructions=instructions,
                         error=None
                     )
+                else:
+                    logger.info(f"No generated code found for designId={request.designId}, tenantId={request.tenantId}")
             except Exception as e:
-                logger.warning(f"Error checking for existing generated code: {str(e)}")
+                logger.error(f"Error checking for existing generated code: {str(e)}", exc_info=True)
         
         # No existing generated code found - queue for processing
         logger.info(f"No existing code found for user {user_id}, design {request.designId}. Queuing request.")
@@ -1612,7 +1622,7 @@ async def get_code_recommendations(
         
         # Send message to Service Bus with proper error handling
         try:
-            sender = service_bus_client.get_queue_sender(queue_name=SERVICE_BUS_QUEUE_NAME)
+            sender = service_bus_client.get_queue_sender(queue_name=AZURE_SERVICE_BUS_CODE_QUEUE)
             async with sender:
                 # Create message payload with all fields + resolved userId
                 message_data = request.model_dump()

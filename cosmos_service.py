@@ -447,6 +447,34 @@ class CosmosDBService:
             logger.error(f"Error in flexible design query: {str(e)}", exc_info=True)
             return None
 
+    async def get_generated_code_by_design_id(self, design_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        """Get generated code by designId and tenantId from the designs container"""
+        try:
+            logger.info(f"Querying generated code: designId={design_id}, tenantId={tenant_id}")
+
+            query = "SELECT * FROM c WHERE c.designId = @designId AND c.tenantId = @tenantId AND c.type = 'generatedCode' ORDER BY c._ts DESC"
+            parameters = [
+                {"name": "@designId", "value": design_id},
+                {"name": "@tenantId", "value": tenant_id}
+            ]
+
+            items = self.designs_container.query_items(
+                query=query,
+                parameters=parameters,
+                max_item_count=1
+            )
+
+            async for item in items:
+                logger.info(f"Found generated code for designId={design_id}, size=~{len(str(item))} chars")
+                return item
+
+            logger.info(f"No generated code found for designId={design_id}, tenantId={tenant_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting generated code by design ID: {str(e)}", exc_info=True)
+            return None
+
     async def list_designs_debug(self, tenant_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
         Debug method to list designs for a tenant to help diagnose query issues.

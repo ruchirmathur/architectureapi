@@ -380,8 +380,10 @@ class CosmosDBService:
             logger.info(f"Querying LLD: architectureId={architecture_id}, tenantId={tenant_id}, applicationName={application_name}")
             
             # Build query dynamically based on available parameters
+            # Match on both top-level architectureId and nested architecture.id
+            # since they can differ (e.g. "07a908c7-..." vs "arch-b73962d2ea43")
             if application_name:
-                query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.applicationName = @applicationName AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
+                query = "SELECT * FROM c WHERE (c.architectureId = @architectureId OR c.architecture.id = @architectureId) AND c.tenantId = @tenantId AND c.applicationName = @applicationName AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
                 parameters = [
                     {"name": "@architectureId", "value": architecture_id},
                     {"name": "@tenantId", "value": tenant_id},
@@ -389,7 +391,7 @@ class CosmosDBService:
                 ]
             else:
                 # Fallback: query without applicationName if not provided
-                query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
+                query = "SELECT * FROM c WHERE (c.architectureId = @architectureId OR c.architecture.id = @architectureId) AND c.tenantId = @tenantId AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
                 parameters = [
                     {"name": "@architectureId", "value": architecture_id},
                     {"name": "@tenantId", "value": tenant_id}
@@ -421,7 +423,7 @@ class CosmosDBService:
         This is a fallback method when exact applicationName match fails.
         """
         try:
-            query = "SELECT * FROM c WHERE c.architectureId = @architectureId AND c.tenantId = @tenantId AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
+            query = "SELECT * FROM c WHERE (c.architectureId = @architectureId OR c.architecture.id = @architectureId) AND c.tenantId = @tenantId AND c.type = 'lowLevelDesign' ORDER BY c._ts DESC"
             parameters = [
                 {"name": "@architectureId", "value": architecture_id},
                 {"name": "@tenantId", "value": tenant_id}

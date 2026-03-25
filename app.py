@@ -1,4 +1,4 @@
-﻿﻿"""
+"""
 Architecture Requirements API - Simplified
 FastAPI application for storing architecture requirements in Cosmos DB
 """

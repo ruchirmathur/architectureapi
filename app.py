@@ -423,9 +423,9 @@ class LLDResponse(BaseModel):
 
 class CodeGenerationRequest(BaseModel):
     """Request model for generating code from LLD"""
-    tenantId: str = Field(default="default", description="Tenant ID")
-    applicationName: str = Field(default="Application", description="Application name")
-    sessionId: str = Field(default="default", description="Session ID")
+    tenantId: str = Field(..., description="Tenant ID")
+    applicationName: str = Field(..., description="Application name")
+    sessionId: str = Field(..., description="Session ID")
     userId: Optional[str] = Field(default=None, description="User ID")
     designId: Optional[str] = Field(default=None, description="Design identifier")
     featureCount: Optional[int] = Field(default=None, description="Number of features to generate code for")

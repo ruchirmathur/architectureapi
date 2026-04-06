@@ -454,7 +454,7 @@ class CosmosDBService:
         try:
             logger.info(f"Querying generated code: designId={design_id}, tenantId={tenant_id}")
 
-            query = "SELECT * FROM c WHERE c.designId = @designId AND c.tenantId = @tenantId AND c.type = 'generatedCode' ORDER BY c._ts DESC"
+            query = "SELECT * FROM c WHERE c.designId = @designId AND c.tenantId = @tenantId AND (c.type = 'generatedCode' OR c.requestType = 'code') ORDER BY c._ts DESC"
             parameters = [
                 {"name": "@designId", "value": design_id},
                 {"name": "@tenantId", "value": tenant_id}

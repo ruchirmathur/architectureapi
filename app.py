@@ -27,12 +27,12 @@ from cosmos_service import CosmosDBService
 # Configure logging
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.ERROR)
+logger.setLevel(logging.INFO)
 
 # Suppress Azure SDK verbose logging
 logging.getLogger('azure').setLevel(logging.ERROR)
 logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.ERROR)
-logging.getLogger('cosmos_service').setLevel(logging.ERROR)
+logging.getLogger('cosmos_service').setLevel(logging.INFO)
 
 # Configuration from environment variables
 COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT", "https://architecture.documents.azure.com:443/")
@@ -60,6 +60,7 @@ MAX_CODE_GEN_OUTPUT_TOKENS = 64000  # Maximum tokens for code generation (needs 
 
 # Cosmos DB Design Container
 COSMOS_DESIGNS_CONTAINER = os.getenv("COSMOS_DESIGNS_CONTAINER", "design")
+COSMOS_CODE_CONTAINER = os.getenv("COSMOS_CODE_CONTAINER", "code")
 
 # GitHub OAuth Configuration
 GITHUB_CLIENT_ID = os.getenv("REACT_APP_GITHUB_CLIENT_ID")
@@ -790,7 +791,8 @@ async def lifespan(app: FastAPI):
         requirements_container=COSMOS_REQUIREMENTS_CONTAINER,
         users_container=COSMOS_USERS_CONTAINER,
         recommendations_container=COSMOS_RECOMMENDATIONS_CONTAINER,
-        designs_container=COSMOS_DESIGNS_CONTAINER
+        designs_container=COSMOS_DESIGNS_CONTAINER,
+        code_container=COSMOS_CODE_CONTAINER
     )
     
     try:
@@ -1567,10 +1569,12 @@ async def get_code_recommendations(
         # Use userId from request if provided, otherwise use authenticated user
         user_id = request.userId or current_user.user_id
         
+        logger.info(f"[CODE API] Incoming request: designId={request.designId}, tenantId={request.tenantId}, userId={user_id}")
+        
         # Check if generated code already exists for this design
         if request.designId:
             try:
-                logger.info(f"Looking for existing code with designId={request.designId}, tenantId={request.tenantId}")
+                logger.info(f"[CODE API] Looking for existing code with designId={request.designId}, tenantId={request.tenantId}")
                 
                 existing_code = await db.get_generated_code_by_design_id(
                     design_id=request.designId,
@@ -1578,19 +1582,26 @@ async def get_code_recommendations(
                 )
                 
                 if existing_code:
-                    logger.info(f"Found existing code for user {user_id}, design {request.designId}")
+                    logger.info(f"[CODE API] Found existing code for designId={request.designId}")
+                    logger.info(f"[CODE API] Document id={existing_code.get('id')}, type={existing_code.get('type')}, requestType={existing_code.get('requestType')}")
+                    logger.info(f"[CODE API] Keys in response: {list(existing_code.keys())}")
+                    logger.info(f"[CODE API] generatedFiles count: {len(existing_code.get('generatedFiles', []))}")
+                    logger.info(f"[CODE API] technologies: {existing_code.get('technologies', [])}")
+                    logger.info(f"[CODE API] Document size: ~{len(str(existing_code))} chars")
                     
                     # Extract generated files and metadata from stored code
-                    generated_files = existing_code.get('generatedFiles', [])
-                    categorized_files = existing_code.get('categorizedFiles', {})
-                    project_structure = existing_code.get('projectStructure', {})
-                    technologies = existing_code.get('technologies', [])
-                    instructions = existing_code.get('instructions', '')
+                    # Data may be nested under 'codeGeneration' key
+                    code_data = existing_code.get('codeGeneration', existing_code)
+                    generated_files = code_data.get('generatedFiles', [])
+                    categorized_files = code_data.get('categorizedFiles', {})
+                    project_structure = code_data.get('projectStructure', {})
+                    technologies = code_data.get('technologies', [])
+                    instructions = code_data.get('instructions', '')
                     
                     # Convert to proper models
                     files = [GeneratedFile(path=f.get('path', ''), content=f.get('content', '')) for f in generated_files]
                     
-                    logger.info(f"Returning existing generated code with {len(files)} files for user {user_id}")
+                    logger.info(f"[CODE API] Returning {len(files)} files to client for designId={request.designId}")
                     
                     return CodeGenerationResponse(
                         success=True,
@@ -1605,9 +1616,9 @@ async def get_code_recommendations(
                         error=None
                     )
                 else:
-                    logger.info(f"No generated code found for designId={request.designId}, tenantId={request.tenantId}")
+                    logger.warning(f"[CODE API] No document returned from Cosmos for designId={request.designId}, tenantId={request.tenantId}")
             except Exception as e:
-                logger.error(f"Error checking for existing generated code: {str(e)}", exc_info=True)
+                logger.error(f"[CODE API] Error checking for existing generated code: {str(e)}", exc_info=True)
         
         # No existing generated code found - queue for processing
         logger.info(f"No existing code found for user {user_id}, design {request.designId}. Queuing request.")

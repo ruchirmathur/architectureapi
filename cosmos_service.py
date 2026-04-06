@@ -17,7 +17,8 @@ class CosmosDBService:
     def __init__(self, endpoint: str, key: str, database_name: str, 
                  requirements_container: str, users_container: str,
                  recommendations_container: str = "recommendations",
-                 designs_container: str = "designs"):
+                 designs_container: str = "designs",
+                 code_container: str = "code"):
         """Initialize Cosmos DB client and get references to existing containers"""
         try:
             # Create Cosmos client
@@ -38,6 +39,9 @@ class CosmosDBService:
             )
             self.designs_container = self.database.get_container_client(
                 container=designs_container
+            )
+            self.code_container = self.database.get_container_client(
+                container=code_container
             )
             
         except Exception as e:
@@ -454,13 +458,13 @@ class CosmosDBService:
         try:
             logger.info(f"Querying generated code: designId={design_id}, tenantId={tenant_id}")
 
-            query = "SELECT * FROM c WHERE c.designId = @designId AND c.tenantId = @tenantId AND (c.type = 'generatedCode' OR c.requestType = 'code') ORDER BY c._ts DESC"
+            query = "SELECT * FROM c WHERE c.designId = @designId AND c.tenantId = @tenantId ORDER BY c._ts DESC"
             parameters = [
                 {"name": "@designId", "value": design_id},
                 {"name": "@tenantId", "value": tenant_id}
             ]
 
-            items = self.designs_container.query_items(
+            items = self.code_container.query_items(
                 query=query,
                 parameters=parameters,
                 max_item_count=1

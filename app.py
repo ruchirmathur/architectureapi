@@ -3,10 +3,12 @@ Architecture Requirements API - Simplified
 FastAPI application for storing architecture requirements in Cosmos DB
 """
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any, Union
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import os
 import json
@@ -18,7 +20,7 @@ from dotenv import load_dotenv
 # Load root .env (shared config) then python_api/.env (secrets) — local wins
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'), override=False)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'), override=True)
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from azure.servicebus.aio import ServiceBusClient
 from azure.servicebus import ServiceBusMessage
 
@@ -28,6 +30,33 @@ from cosmos_service import CosmosDBService
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Per-repo lock to serialize file uploads (prevents 409 conflicts from parallel PUTs)
+_repo_upload_locks: Dict[str, asyncio.Lock] = {}
+
+
+class _WorkflowScopeMissing(Exception):
+    """Raised when a GitHub token lacks the 'workflow' OAuth scope for .github/workflows/ paths."""
+    def __init__(self, reauth_url: str, current_scopes: str, file_path: str = ""):
+        self.reauth_url = reauth_url
+        self.current_scopes = current_scopes
+        self.file_path = file_path
+        super().__init__(f"workflow_scope_missing: {current_scopes}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "reauth_required": True,
+            "reauth_reason": "workflow_scope_missing",
+            "reauth_url": self.reauth_url,
+            "current_scopes": self.current_scopes,
+            "required_scopes": "read:user repo workflow",
+            "file_path": self.file_path,
+            "skipped": True,
+            "message": (
+                "GitHub token is missing the 'workflow' OAuth scope. "
+                "Redirect the user to reauth_url to re-authorize, then retry the upload."
+            ),
+        }
 
 # Suppress Azure SDK verbose logging
 logging.getLogger('azure').setLevel(logging.ERROR)
@@ -66,6 +95,18 @@ COSMOS_CODE_CONTAINER = os.getenv("COSMOS_CODE_CONTAINER", "code")
 GITHUB_CLIENT_ID = os.getenv("REACT_APP_GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 
+# Bitbucket OAuth Configuration
+BITBUCKET_CLIENT_ID = os.getenv("BITBUCKET_CLIENT_ID")
+BITBUCKET_CLIENT_SECRET = os.getenv("BITBUCKET_CLIENT_SECRET")
+
+# Azure DevOps OAuth Configuration
+AZURE_DEVOPS_CLIENT_ID = os.getenv("AZURE_DEVOPS_CLIENT_ID")
+AZURE_DEVOPS_CLIENT_SECRET = os.getenv("AZURE_DEVOPS_CLIENT_SECRET")
+
+# GitLab OAuth Configuration
+GITLAB_CLIENT_ID = os.getenv("GITLAB_CLIENT_ID")
+GITLAB_CLIENT_SECRET = os.getenv("GITLAB_CLIENT_SECRET")
+
 
 # Global cosmos service instance
 cosmos_service: Optional[CosmosDBService] = None
@@ -96,6 +137,9 @@ class Requirements(BaseModel):
     performance: Optional[Any] = None
     reliability: Optional[Any] = None
     integrations: Optional[Any] = None
+    typeOfData: Optional[Any] = None  # Can be string or array
+    typeOfUsers: Optional[Any] = None  # Can be string or array
+    numberOfScreens: Optional[Any] = None
 
 
 class StepTransition(BaseModel):
@@ -518,6 +562,87 @@ class InfrastructureResponse(BaseModel):
     services: List[str] = Field(default_factory=list, description="All cloud services required")
     deploymentInstructions: str = Field(default="", description="Step-by-step deployment instructions")
     estimatedCost: Optional[str] = Field(default="", description="Estimated monthly cost range")
+    error: Optional[str] = None
+
+
+# ==================== DEVOPS SCRIPT GENERATION MODELS ====================
+
+class DevOpsScriptRequest(BaseModel):
+    """Request model for generating DevOps scripts from a single architecture recommendation"""
+    tenantId: str = Field(..., description="Tenant ID")
+    sessionId: str = Field(..., description="Session ID")
+    applicationName: Optional[str] = Field(default="", description="Application name")
+    architecture: Dict[str, Any] = Field(..., description="Single architecture recommendation object")
+    features: Optional[List[str]] = Field(default_factory=list, description="Application features")
+    overview: Optional[str] = Field(default="", description="Application overview")
+
+
+class DevOpsScript(BaseModel):
+    """Represents a single generated DevOps script"""
+    fileName: str = Field(..., description="Script file name with extension (e.g., main.tf, deploy.sh)")
+    category: str = Field(..., description="Category: iac, cicd, deployment, configuration, monitoring, security, networking, database, helper")
+    language: str = Field(..., description="Script language/format: terraform, bash, powershell, yaml, json, hcl, dockerfile, etc.")
+    content: str = Field(..., description="Complete script content")
+    description: str = Field(..., description="What this script does")
+    executionOrder: Optional[int] = Field(default=None, description="Suggested execution order (1 = first)")
+    dependencies: Optional[List[str]] = Field(default_factory=list, description="Other script fileNames this depends on")
+
+
+class DevOpsServiceCost(BaseModel):
+    """Cost estimate for a single cloud service"""
+    service: str = Field(..., description="Cloud service name (e.g., Cloud Run, Cloud SQL, Lambda, RDS)")
+    description: str = Field(default="", description="What this service is used for in the architecture")
+    monthlyCostMin: float = Field(default=0, description="Minimum estimated monthly cost in USD")
+    monthlyCostMax: float = Field(default=0, description="Maximum estimated monthly cost in USD")
+    pricingModel: str = Field(default="", description="Pricing model (pay-per-use, reserved, committed, flat-rate)")
+    pricingDetails: str = Field(default="", description="Detailed pricing calculation assumptions (units, rates, expected usage)")
+    costOptimizationTips: Optional[str] = Field(default="", description="Tips to reduce cost for this specific service")
+
+
+class DevOpsEnvironmentCost(BaseModel):
+    """Cost estimate for a specific environment"""
+    environment: str = Field(..., description="Environment name (dev, staging, production)")
+    monthlyCostMin: float = Field(default=0, description="Minimum estimated total monthly cost in USD")
+    monthlyCostMax: float = Field(default=0, description="Maximum estimated total monthly cost in USD")
+    notes: str = Field(default="", description="Environment-specific cost notes (e.g., dev uses smaller instances)")
+
+
+class DevOpsCostBreakdown(BaseModel):
+    """Comprehensive cost breakdown for the architecture"""
+    totalMonthlyCostMin: float = Field(default=0, description="Total minimum monthly cost in USD (production)")
+    totalMonthlyCostMax: float = Field(default=0, description="Total maximum monthly cost in USD (production)")
+    currency: str = Field(default="USD", description="Currency")
+    serviceCosts: List[DevOpsServiceCost] = Field(default_factory=list, description="Per-service cost breakdown")
+    environmentCosts: List[DevOpsEnvironmentCost] = Field(default_factory=list, description="Per-environment cost estimates")
+    assumptions: str = Field(default="", description="Key pricing assumptions (region, usage patterns, reserved vs on-demand)")
+    costOptimizationSummary: str = Field(default="", description="Overall cost optimization recommendations")
+    freeTrialNotes: Optional[str] = Field(default="", description="Free tier or trial credits applicable")
+
+
+class RequiredSecret(BaseModel):
+    """A single CI/CD secret required by the generated scripts — value NOT included, to be filled in by the user"""
+    name: str = Field(..., description="Secret key name as referenced in the pipeline (e.g. GCP_SA_KEY, AWS_ACCESS_KEY_ID)")
+    description: str = Field(..., description="Human-readable explanation of what this secret is and where to obtain it")
+    required: bool = Field(default=True, description="Whether the secret is mandatory for the pipeline to run")
+    example: str = Field(default="", description="Non-sensitive format hint or placeholder (e.g. 'my-project-123', '{\"type\":\"service_account\",...}'). Never a real value.")
+
+
+class DevOpsScriptResponse(BaseModel):
+    """Response model for DevOps script generation"""
+    success: bool
+    message: str = Field(..., description="Response message")
+    applicationName: str = Field(default="", description="Application name")
+    architectureName: str = Field(default="", description="Architecture name")
+    cloudProvider: str = Field(default="", description="Cloud provider")
+    iacTool: str = Field(default="", description="Primary IaC tool used (Terraform, CloudFormation, Bicep, etc.)")
+    cicdPlatform: str = Field(default="", description="CI/CD platform used (GitHub Actions, GitLab CI, etc.)")
+    scripts: List[DevOpsScript] = Field(default_factory=list, description="All generated scripts")
+    executionGuide: str = Field(default="", description="Step-by-step guide to execute all scripts in order")
+    prerequisites: List[str] = Field(default_factory=list, description="Required tools and access before running scripts")
+    services: List[str] = Field(default_factory=list, description="All cloud services provisioned")
+    secrets: List[RequiredSecret] = Field(default_factory=list, description="All CI/CD secrets required by the generated scripts — names only, values to be supplied by the user")
+    costBreakdown: Optional[DevOpsCostBreakdown] = Field(default=None, description="Detailed cost breakdown per service and environment")
+    estimatedCost: Optional[str] = Field(default="", description="Estimated monthly cost summary")
     error: Optional[str] = None
 
 
@@ -3226,6 +3351,839 @@ MANDATORY: Generate COMPLETE, PARAMETERIZED IaC templates and FUNCTIONAL CI/CD p
         )
 
 
+# ==================== DEVOPS SCRIPT GENERATION ====================
+
+@app.post("/api/generate-devops-scripts", response_model=DevOpsScriptResponse)
+async def generate_devops_scripts(
+    request: DevOpsScriptRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: CosmosDBService = Depends(get_cosmos_service)
+):
+    """
+    Generate comprehensive DevOps scripts from a single architecture recommendation.
+    
+    Analyzes the architecture's infrastructure, technology stack, CI/CD requirements,
+    and generates production-ready scripts for:
+    - Infrastructure provisioning (Terraform/CloudFormation/Bicep/etc.)
+    - CI/CD pipelines (GitHub Actions/GitLab CI/Azure DevOps/etc.)
+    - Application deployment scripts (Docker, Kubernetes, serverless deploy)
+    - Configuration and environment setup
+    - Monitoring and observability setup
+    - Security and networking configuration
+    - Database migration and setup scripts
+    - Helper/utility scripts
+    """
+    try:
+        arch = request.architecture
+        arch_name = arch.get("name", "")
+        arch_description = arch.get("description", "")
+        tech_stack = arch.get("technologyStack", {})
+        infra = tech_stack.get("infra", {})
+        cicd = tech_stack.get("cicd", {})
+        metrics = arch.get("metrics", {})
+
+        cloud_provider = tech_stack.get("cloudProvider", "")
+        languages = tech_stack.get("languages", "")
+        frameworks = tech_stack.get("frameworks", "")
+        runtime = tech_stack.get("runtime", "")
+
+        # Extract infra details
+        compute = infra.get("compute", "")
+        database = infra.get("database", "")
+        cache = infra.get("cache", "")
+        messaging = infra.get("messaging", "")
+        storage = infra.get("storage", "")
+        api_gateway = infra.get("apiGateway", "")
+        authentication = infra.get("authentication", "")
+        security = infra.get("security", "")
+        networking = infra.get("networking", "")
+        monitoring = infra.get("monitoring", "")
+        logging_infra = infra.get("logging", "")
+
+        # Extract CI/CD details
+        pipeline = cicd.get("pipeline", "")
+        containerization = cicd.get("containerization", "")
+        testing = cicd.get("testing", "")
+        iac = cicd.get("iac", "")
+
+        app_name = request.applicationName or arch_name or "application"
+        features_str = "\n".join([f"  - {f}" for f in request.features]) if request.features else "  - No specific features listed"
+        overview = request.overview or arch_description
+
+        logger.info(f"Generating DevOps scripts for: {app_name} ({arch_name}) on {cloud_provider}")
+
+        if not OPENAI_API_KEY or not OPENAI_ENDPOINT:
+            raise HTTPException(status_code=500, detail="OpenAI API is not configured")
+
+        # Build compact infra summary — only include services that exist
+        infra_lines = []
+        for label, val in [("Compute", compute), ("Database", database), ("Cache", cache),
+                           ("Messaging", messaging), ("Storage", storage), ("API Gateway", api_gateway),
+                           ("Auth", authentication), ("Security", security), ("Networking", networking),
+                           ("Monitoring", monitoring), ("Logging", logging_infra)]:
+            if val:
+                infra_lines.append(f"- {label}: {val}")
+        infra_block = "\n".join(infra_lines) if infra_lines else "- See architecture description"
+
+        cicd_lines = []
+        for label, val in [("Pipeline", pipeline), ("Containers", containerization),
+                           ("Testing", testing), ("IaC", iac)]:
+            if val:
+                cicd_lines.append(f"- {label}: {val}")
+        cicd_block = "\n".join(cicd_lines) if cicd_lines else "- Choose best for cloud provider"
+
+        system_prompt = (
+            "You are a senior DevOps engineer. Every script you generate will be executed verbatim "
+            "by a real CI/CD runner with no human fixups. If a command fails, the pipeline fails. "
+            "Apply every rule below with zero exceptions. Return ONLY valid JSON.\n\n"
+
+            "RULE 1 — CI/CD ENV VARS MUST NEVER BE BLANK:\n"
+            "The env: block of every workflow job or step MUST source each variable from the platform "
+            "secret store. An empty value (e.g. 'GCP_PROJECT: ' with nothing after the colon) is "
+            "FORBIDDEN — it causes fatal failures such as 'gcr.io//app:sha' (invalid Docker reference) "
+            "and 'set -u: GCP_PROJECT: unbound variable'. \n"
+            "GitHub Actions: ${{ secrets.VAR }}. Azure Pipelines: $(VAR). "
+            "GitLab CI / Bitbucket Pipelines: $VAR (from masked CI/CD variables).\n\n"
+
+            "RULE 2 — TEST STEPS MUST BE GUARDED BY FILE-EXISTENCE CHECKS:\n"
+            "NEVER run a test command unconditionally. With set -euo pipefail active, running "
+            "'go test ./...' in a directory that has no go.mod, or 'npm test' where no package.json "
+            "exists, will immediately fail and abort the pipeline. "
+            "Guard every test step with the correct existence check for that language:\n"
+            "  Go:            if [ -f go.mod ]; then go test ./... -v; else echo 'No go.mod, skipping'; fi\n"
+            "  Node (npm):    if [ -f package.json ]; then npm ci && npm test; else echo 'Skipping'; fi\n"
+            "  Node (yarn):   if [ -f yarn.lock ]; then yarn --frozen-lockfile && yarn test; else echo 'Skipping'; fi\n"
+            "  Python:        if [ -f pytest.ini ] || [ -f setup.cfg ] || [ -d tests ]; then pytest -v; else echo 'Skipping'; fi\n"
+            "  Java (Maven):  if [ -f pom.xml ]; then mvn test -q; else echo 'Skipping'; fi\n"
+            "  Java (Gradle): if [ -f build.gradle ] || [ -f build.gradle.kts ]; then ./gradlew test; else echo 'Skipping'; fi\n"
+            "  Ruby:          if [ -f Gemfile ]; then bundle install && bundle exec rspec; else echo 'Skipping'; fi\n"
+            "  .NET:          find . -maxdepth 2 \\( -name '*.sln' -o -name '*.csproj' \\) | grep -q . && dotnet test || echo 'Skipping'\n"
+            "  Rust:          if [ -f Cargo.toml ]; then cargo test; else echo 'Skipping'; fi\n\n"
+
+            "RULE 3 — SHELL SCRIPT STRUCTURE AND VAR VALIDATION:\n"
+            "Every .sh file must open with:\n"
+            "  #!/usr/bin/env bash\n"
+            "  set -euo pipefail\n"
+            "Then immediately validate every required env var with the Bash null-check expansion "
+            "(this is safe under set -u and gives a clear error message):\n"
+            "  : ${GCP_PROJECT:?'GCP_PROJECT is required. Set it in .env or CI secrets.'}\n"
+            "Build compound values (image tags, URLs) ONLY after all component vars are validated.\n\n"
+
+            "RULE 4 — DOCKER IMAGE REFERENCES:\n"
+            "Construct derived values only after validating every component:\n"
+            "  : ${GCP_PROJECT:?'required'}\n"
+            "  : ${APP_NAME:?'required'}\n"
+            "  : ${IMAGE_TAG:?'required'}\n"
+            "  IMAGE=\"gcr.io/${GCP_PROJECT}/${APP_NAME}:${IMAGE_TAG}\"   # safe — all vars validated\n"
+            "Never inline the construction before the guards.\n\n"
+
+            "RULE 5 — COMMANDS MUST MATCH THE ACTUAL LANGUAGE AND RUNTIME:\n"
+            "Read the runtime, languages, and frameworks fields. Use ONLY the matching toolchain commands. "
+            "Do not emit 'go test' for a Node project or 'npm install' for a Python project. "
+            "The runtime setup step in CI/CD MUST use the correct official action pinned to a major version:\n"
+            "  Go:      actions/setup-go@v5     (go-version from go.mod or specify e.g. '1.22')\n"
+            "  Node:    actions/setup-node@v4   (node-version, e.g. '20')\n"
+            "  Python:  actions/setup-python@v5 (python-version, e.g. '3.12')\n"
+            "  Java:    actions/setup-java@v4   (distribution: 'temurin', java-version)\n"
+            "  .NET:    actions/setup-dotnet@v4\n"
+            "  Ruby:    ruby/setup-ruby@v1\n"
+            "Cloud auth MUST use the official action:\n"
+            "  GCP:   google-github-actions/auth@v2 — credentials_json MUST go under 'with:', NOT 'env:'.\n"
+            "    The action requires EXACTLY ONE of workload_identity_provider OR credentials_json as a 'with:' input.\n"
+            "    Passing it via 'env:' is silently ignored and causes this fatal error:\n"
+            "      'must specify exactly one of workload_identity_provider or credentials_json'\n"
+            "    CORRECT:\n"
+            "      - uses: google-github-actions/auth@v2\n"
+            "        with:\n"
+            "          credentials_json: '${{ secrets.GCP_SA_KEY }}'\n"
+            "    WRONG (triggers the error above):\n"
+            "      - uses: google-github-actions/auth@v2\n"
+            "        env:\n"
+            "          credentials_json: ${{ secrets.GCP_SA_KEY }}   # env: is NOT read by this action\n"
+            "    Also WRONG: specifying both workload_identity_provider AND credentials_json in the same step.\n"
+            "  AWS:   aws-actions/configure-aws-credentials@v4\n"
+            "  Azure: azure/login@v2\n\n"
+
+            "RULE 6 — GITHUB ACTIONS WORKFLOW REQUIRED STRUCTURE:\n"
+            "on: MUST include push (branches: [main]) AND workflow_dispatch with an environment input. "
+            "Every job MUST declare runs-on. Repo checkout MUST use actions/checkout@v4. "
+            "No job may reference a secret that is not listed in the env: or with: block of that job/step.\n\n"
+
+            "RULE 7 — SYNTAX CORRECTNESS — HCL ESCAPING IS CRITICAL:\n"
+            "Every file must be valid for its format with no modifications.\n"
+            "YAML: correct indentation (2 spaces), no tabs, booleans unquoted, strings quoted when containing ':'.\n"
+            "Bash: all variable expansions double-quoted, no undefined vars under set -u.\n"
+            "Dockerfile: FROM first, valid instruction order, no shell variable expansion in COPY paths.\n"
+            "HCL / Terraform — the following rules are MANDATORY:\n"
+            "  1. A backslash (\\) inside a double-quoted HCL string is an ESCAPE CHARACTER. "
+            "'\"\\\"' is a FATAL syntax error: it consumes the closing quote and turns EVERY subsequent "
+            "line in the file into a continuation of that broken string, producing hundreds of "
+            "'Invalid multi-line string' errors. A literal backslash in HCL requires '\\\\'.\n"
+            "  2. GCP project IDs contain ONLY lowercase letters, digits, and hyphens — they NEVER "
+            "contain backslashes, forward slashes, or any character that needs replace(). "
+            "NEVER call replace(var.project, \"\\\\\\\\\", \"-\") or replace(var.project, \"/\", \"-\"). "
+            "Use the project ID directly in interpolation: \"${var.app_name}-${var.project}\".\n"
+            "  3. Bucket names and resource names must be constructed with simple string interpolation "
+            "only: \"${var.app_name}-suffix-${var.project}\". No replace(), no regex, no backslash literals.\n"
+            "  4. All HCL blocks must be closed. Attribute syntax is: name = value (with = not :).\n"
+            "  5. String interpolation uses \"${...}\" (HCL) — never \"${{...}}\" or \"$(...)\" inside .tf files.\n"
+            "  6. Never mix YAML, shell, or Python syntax into .tf files.\n\n"
+
+            "RULE 8 — COST: ALWAYS FREE TIER / LOWEST COST:\n"
+            "Use free-tier eligible SKUs (f1-micro, t2.micro, B1s, Cloud Run free tier, etc.). "
+            "Prefer serverless / scale-to-zero over always-on VMs. Set min-instances=0. "
+            "Use free-tier databases and single-region deployments for dev/staging."
+        )
+
+        user_prompt = f"""Generate DevOps scripts for this architecture.
+
+App: {app_name}
+Architecture: {arch_name}
+Cloud: {cloud_provider}
+Runtime: {runtime} | Languages: {languages} | Frameworks: {frameworks}
+Features: {', '.join(request.features) if request.features else 'N/A'}
+Availability: {metrics.get('availability', 'N/A')} | Cost range: {metrics.get('cost', 'N/A')}
+
+Infrastructure:
+{infra_block}
+
+CI/CD:
+{cicd_block}
+
+Generate these scripts. Each MUST be complete, immediately runnable, and pass without modification:
+1. IaC (category:"iac") — main infra + variables + outputs + networking + IAM. Use the best tool for the cloud provider.
+2. CI/CD pipeline (category:"cicd") — full build, test, and deploy pipeline. No echo-stub steps.
+3. Deployment (category:"deployment") — deploy.sh, rollback.sh, health-check.sh
+4. Config (category:"configuration") — .env.example, Dockerfile (if containerised), env-specific var files
+5. Helpers (category:"helper") — cleanup.sh, status.sh
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A. CI/CD FILE NAMING AND TRIGGERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• The primary CI/CD file MUST be named EXACTLY ".github/workflows/deploy.yml".
+• If Azure DevOps is used, ALSO generate "azure-pipelines.yml".
+• If GitLab is the source control, ALSO generate ".gitlab-ci.yml".
+• If Bitbucket is the source control, ALSO generate "bitbucket-pipelines.yml".
+• GitHub Actions on: MUST include BOTH:
+    push:
+      branches: [main]
+    workflow_dispatch:
+      inputs:
+        environment:
+          description: 'Target environment'
+          required: false
+          default: 'dev'
+          type: choice
+          options: [dev, staging, production]
+• For Azure Pipelines: include trigger: and a parameters: block for manual environment selection.
+• For GitLab CI: add when: manual to every deploy job.
+• For Bitbucket Pipelines: add a custom: section for manual pipeline triggers.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+B. CI/CD ENV VARS — SECRETS ONLY, NEVER BLANK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORBIDDEN — these patterns WILL cause failures at runtime:
+  env:
+    GCP_PROJECT:          # blank  → gcr.io//app:sha  → invalid Docker reference
+    GCP_REGION:           # blank  → missing region argument → command not found
+    GCP_SA_KEY:           # blank  → auth failure
+    IMAGE_REGISTRY:       # blank  → malformed image URL
+
+REQUIRED — every deployment-specific variable MUST reference the platform secret store:
+  GitHub Actions:       ${{{{ secrets.GCP_PROJECT }}}}, ${{{{ secrets.AWS_ACCOUNT_ID }}}}, ${{{{ secrets.AZURE_SUBSCRIPTION_ID }}}}
+  Azure Pipelines:      $(GCP_PROJECT), $(AWS_ACCOUNT_ID)
+  GitLab CI:            $GCP_PROJECT, $AWS_ACCOUNT_ID  (masked CI/CD variable)
+  Bitbucket Pipelines:  $GCP_PROJECT, $AWS_ACCOUNT_ID  (repository variable)
+
+This applies to ALL of: cloud project/account IDs, regions, registry hostnames, service account
+keys, cluster names, subscription IDs, connection strings, and any deployment identifier.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+C. TEST STEPS — ALWAYS GUARDED BY FILE-EXISTENCE CHECK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+With set -euo pipefail, running 'go test ./...' where no go.mod exists produces:
+  "pattern ./...: directory prefix . does not contain main module" → exit 1 → pipeline aborted.
+The same applies to every other language: 'npm test' without package.json, 'mvn test' without
+pom.xml, etc. ALL test commands MUST be wrapped with the appropriate guard:
+
+  Go:            if [ -f go.mod ]; then go test ./... -v; else echo "No go.mod — skipping tests"; fi
+  Node (npm):    if [ -f package.json ]; then npm ci && npm test; else echo "No package.json — skipping"; fi
+  Node (yarn):   if [ -f yarn.lock ]; then yarn --frozen-lockfile && yarn test; else echo "No yarn.lock — skipping"; fi
+  Python:        if [ -f pytest.ini ] || [ -f setup.cfg ] || [ -d tests ]; then pytest -v; else echo "No tests — skipping"; fi
+  Java (Maven):  if [ -f pom.xml ]; then mvn test -q; else echo "No pom.xml — skipping"; fi
+  Java (Gradle): if [ -f build.gradle ] || [ -f build.gradle.kts ]; then ./gradlew test; else echo "No build.gradle — skipping"; fi
+  Ruby:          if [ -f Gemfile ]; then bundle install && bundle exec rspec; else echo "No Gemfile — skipping"; fi
+  .NET:          find . -maxdepth 2 \\( -name '*.sln' -o -name '*.csproj' \\) | grep -q . && dotnet test || echo "No project — skipping"
+  Rust:          if [ -f Cargo.toml ]; then cargo test; else echo "No Cargo.toml — skipping"; fi
+
+In GitHub Actions, this can be implemented as an inline shell guard (preferred) or as a step
+"if:" condition checking a file with hashFiles().
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+D. SHELL SCRIPT VAR VALIDATION PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Every .sh script MUST open with:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+Then validate EVERY required variable using Bash null-check expansion before first use:
+  : ${{GCP_PROJECT:?'GCP_PROJECT is required — set it in .env or CI secrets.'}}
+  : ${{GCP_REGION:?'GCP_REGION is required.'}}
+  : ${{APP_NAME:?'APP_NAME is required.'}}
+  : ${{IMAGE_TAG:?'IMAGE_TAG is required.'}}
+
+Build compound values ONLY after all component vars are validated:
+  IMAGE="gcr.io/${{GCP_PROJECT}}/${{APP_NAME}}:${{IMAGE_TAG}}"   # safe — every component validated above
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+E. RUNTIME-SPECIFIC SETUP — USE THE CORRECT ACTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use ONLY the build/test/install commands that match the runtime and language above.
+Do NOT emit Go commands for a Node project, npm commands for a Python project, etc.
+The setup step MUST use the correct official action, pinned to the latest major version:
+  Go:      uses: actions/setup-go@v5      with: {{ go-version: '1.22' }}
+  Node:    uses: actions/setup-node@v4    with: {{ node-version: '20' }}
+  Python:  uses: actions/setup-python@v5  with: {{ python-version: '3.12' }}
+  Java:    uses: actions/setup-java@v4    with: {{ distribution: 'temurin', java-version: '21' }}
+  .NET:    uses: actions/setup-dotnet@v4
+  Ruby:    uses: ruby/setup-ruby@v1       with: {{ bundler-cache: true }}
+
+Cloud authentication MUST use the official action:
+  GCP:   uses: google-github-actions/auth@v2
+         with:
+           credentials_json: '${{{{ secrets.GCP_SA_KEY }}}}'
+
+  CRITICAL — google-github-actions/auth@v2 RULES (failure to follow = always-failing pipeline):
+  • credentials_json MUST be placed under 'with:' — NEVER under 'env:'. The action does NOT read 'env:' inputs.
+  • The action requires EXACTLY ONE of 'workload_identity_provider' OR 'credentials_json'. Not both, not neither.
+  • If either is missing or put in the wrong block, the action always fails with:
+      "must specify exactly one of workload_identity_provider or credentials_json"
+
+  CORRECT:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: '${{{{ secrets.GCP_SA_KEY }}}}'
+
+  WRONG — each pattern below causes the error above:
+    # Missing with: entirely
+    - uses: google-github-actions/auth@v2
+
+    # Key placed in env: instead of with:
+    - uses: google-github-actions/auth@v2
+      env:
+        credentials_json: '${{{{ secrets.GCP_SA_KEY }}}}'
+
+    # Both inputs specified simultaneously
+    - uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: 'projects/123/...'
+        credentials_json: '${{{{ secrets.GCP_SA_KEY }}}}'
+
+  AWS:   uses: aws-actions/configure-aws-credentials@v4
+  Azure: uses: azure/login@v2
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+F. SYNTAX CORRECTNESS — READ EVERY BULLET, EACH PREVENTS A REAL FAILURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HCL / TERRAFORM (most dangerous — one wrong character corrupts the entire file):
+• BACKSLASH IN HCL STRINGS IS AN ESCAPE CHARACTER. Writing replace(var.x, "\" — with a SINGLE
+  backslash before the closing quote — is a fatal parse error. Terraform treats the \" as an
+  escaped quote, so the string never closes, and EVERY remaining line in the file becomes part
+  of that one broken string, producing dozens of "Invalid multi-line string" errors.
+  A literal backslash requires "\\". However:
+• GCP project IDs contain ONLY [a-z0-9-]. They NEVER contain backslashes or forward slashes.
+  NEVER use replace(var.project, "...", "-") for any backslash or slash. Use the project ID
+  directly: "${{var.app_name}}-${{var.project}}". This is always safe and correct.
+• Bucket names, resource names, and all name attributes MUST use plain string interpolation
+  only: "${{var.app_name}}-<suffix>-${{var.project}}". No replace(), no regex, no escape sequences.
+• All HCL blocks MUST be closed (matching braces). Attribute syntax is `name = value`.
+• String interpolation in .tf files uses "${{...}}" — NEVER "$(...)" or "${{{{ }}}}", which belong
+  to shell and GitHub Actions respectively.
+• Comments in HCL use # or // — never /* inside a string value.
+
+YAML:
+• 2-space indentation, no tabs. Booleans unquoted (true/false). Strings containing `:` or `#`
+  MUST be quoted. No := anywhere — it is invalid YAML. Multiline strings use | or >.
+
+Bash:
+• All variable expansions double-quoted: "$VAR", "${{VAR}}". No undefined vars under set -u.
+• Use [[ ]] for string comparisons, [ ] for POSIX. Do not mix.
+
+Dockerfile:
+• FROM is first (except ARG for build args). No shell variable expansion in COPY paths.
+
+JSON:
+• Double-quoted keys only, no trailing commas, no comments.
+• Do not borrow syntax from another language into a file of a different type.
+
+List every required secret/variable in executionGuide and prerequisites.
+
+COST PRIORITY: Always use FREE TIER and LOWEST COST options:
+- Use free-tier eligible instance sizes/SKUs (e.g., f1-micro, t2.micro, B1s, e2-micro, Cloud Run free tier)
+- Use serverless/pay-per-use services over always-on instances wherever possible
+- Use free-tier databases (Cloud SQL free trial, RDS free tier, Cosmos DB free tier, Firestore free tier)
+- Use free-tier caching (small Redis, or skip cache in dev and use application-level caching)
+- Prefer managed serverless (Cloud Functions, Lambda, Azure Functions) over VMs/containers for low traffic
+- Set min-instances=0 so services scale to zero when idle
+- Use single-region, no HA replicas for dev/staging
+- In IaC variables, set defaults to the smallest/cheapest tier available
+- Add comments in scripts showing the free-tier limits and when paid pricing kicks in
+
+Also provide a costBreakdown with per-service costs (realistic, based on cloud pricing) and per-environment totals (dev/staging/prod).
+
+Return JSON:
+{{
+  "applicationName": "{app_name}",
+  "architectureName": "{arch_name}",
+  "cloudProvider": "",
+  "iacTool": "",
+  "cicdPlatform": "",
+  "scripts": [
+    {{
+      "fileName": "path/file.ext",
+      "category": "iac|cicd|deployment|configuration|helper",
+      "language": "terraform|bash|yaml|json|hcl|dockerfile",
+      "content": "full script content",
+      "description": "what it does",
+      "executionOrder": 1,
+      "dependencies": []
+    }}
+  ],
+  "executionGuide": "step-by-step execution instructions",
+  "prerequisites": ["required tools"],
+  "services": ["cloud services used"],
+  "secrets": [
+    {{
+      "name": "SECRET_NAME",
+      "description": "What this secret is and where to obtain it (e.g. GCP Service Account Key — download JSON from IAM & Admin > Service Accounts)",
+      "required": true,
+      "example": "non-sensitive format hint only — e.g. my-project-123 or {{\"type\":\"service_account\",...}}"
+    }}
+  ],
+  "costBreakdown": {{
+    "totalMonthlyCostMin": 0.0,
+    "totalMonthlyCostMax": 0.0,
+    "currency": "USD",
+    "serviceCosts": [
+      {{
+        "service": "name",
+        "description": "purpose",
+        "monthlyCostMin": 0.0,
+        "monthlyCostMax": 0.0,
+        "pricingModel": "pay-per-use|reserved",
+        "pricingDetails": "calculation details",
+        "costOptimizationTips": "tip"
+      }}
+    ],
+    "environmentCosts": [
+      {{"environment": "dev", "monthlyCostMin": 0.0, "monthlyCostMax": 0.0, "notes": ""}},
+      {{"environment": "staging", "monthlyCostMin": 0.0, "monthlyCostMax": 0.0, "notes": ""}},
+      {{"environment": "production", "monthlyCostMin": 0.0, "monthlyCostMax": 0.0, "notes": ""}}
+    ],
+    "assumptions": "",
+    "costOptimizationSummary": "",
+    "freeTrialNotes": ""
+  }},
+  "estimatedCost": "$X-$Y/month production"
+}}"""
+
+        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_ENDPOINT)
+
+        try:
+            completion = client.chat.completions.create(
+                model=OPENAI_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=MAX_OUTPUT_TOKENS
+            )
+
+            message = completion.choices[0].message
+            if hasattr(message, "parsed") and message.parsed is not None:
+                result = message.parsed
+            else:
+                content = message.content or ""
+                if not content.strip():
+                    raise HTTPException(status_code=502, detail="AI service returned empty response for DevOps scripts")
+                result = json.loads(content)
+
+        except HTTPException:
+            raise
+        except json.JSONDecodeError as je:
+            logger.error(f"Failed to parse OpenAI response as JSON: {str(je)}")
+            raise HTTPException(status_code=502, detail="Failed to parse AI response for DevOps scripts")
+        except Exception as openai_err:
+            logger.error(f"OpenAI error during DevOps script generation: {str(openai_err)}", exc_info=True)
+            raise HTTPException(status_code=502, detail=f"AI DevOps script generation failed: {str(openai_err)}")
+
+        # Parse scripts from result
+        raw_scripts = result.get("scripts", [])
+        scripts = []
+        for s in raw_scripts:
+            if isinstance(s, dict) and s.get("fileName") and s.get("content"):
+                scripts.append(DevOpsScript(
+                    fileName=s.get("fileName", ""),
+                    category=s.get("category", "iac"),
+                    language=s.get("language", ""),
+                    content=s.get("content", ""),
+                    description=s.get("description", ""),
+                    executionOrder=s.get("executionOrder"),
+                    dependencies=s.get("dependencies", [])
+                ))
+
+        # Sort scripts by execution order
+        scripts.sort(key=lambda x: x.executionOrder if x.executionOrder is not None else 999)
+
+        iac_tool = result.get("iacTool", "")
+        cicd_platform = result.get("cicdPlatform", "")
+        services = result.get("services", [])
+        execution_guide = result.get("executionGuide", "")
+        prerequisites = result.get("prerequisites", [])
+        estimated_cost = result.get("estimatedCost", "")
+        detected_cloud = result.get("cloudProvider", cloud_provider)
+
+        # Parse required secrets
+        secrets = [
+            RequiredSecret(
+                name=s.get("name", ""),
+                description=s.get("description", ""),
+                required=bool(s.get("required", True)),
+                example=s.get("example", ""),
+            )
+            for s in result.get("secrets", [])
+            if isinstance(s, dict) and s.get("name")
+        ]
+
+        # Parse cost breakdown
+        cost_breakdown_data = result.get("costBreakdown", {})
+        cost_breakdown = None
+        if cost_breakdown_data and isinstance(cost_breakdown_data, dict):
+            service_costs = [
+                DevOpsServiceCost(
+                    service=sc.get("service", ""),
+                    description=sc.get("description", ""),
+                    monthlyCostMin=float(sc.get("monthlyCostMin", 0)),
+                    monthlyCostMax=float(sc.get("monthlyCostMax", 0)),
+                    pricingModel=sc.get("pricingModel", ""),
+                    pricingDetails=sc.get("pricingDetails", ""),
+                    costOptimizationTips=sc.get("costOptimizationTips", "")
+                )
+                for sc in cost_breakdown_data.get("serviceCosts", [])
+                if isinstance(sc, dict) and sc.get("service")
+            ]
+            env_costs = [
+                DevOpsEnvironmentCost(
+                    environment=ec.get("environment", ""),
+                    monthlyCostMin=float(ec.get("monthlyCostMin", 0)),
+                    monthlyCostMax=float(ec.get("monthlyCostMax", 0)),
+                    notes=ec.get("notes", "")
+                )
+                for ec in cost_breakdown_data.get("environmentCosts", [])
+                if isinstance(ec, dict) and ec.get("environment")
+            ]
+            cost_breakdown = DevOpsCostBreakdown(
+                totalMonthlyCostMin=float(cost_breakdown_data.get("totalMonthlyCostMin", 0)),
+                totalMonthlyCostMax=float(cost_breakdown_data.get("totalMonthlyCostMax", 0)),
+                currency=cost_breakdown_data.get("currency", "USD"),
+                serviceCosts=service_costs,
+                environmentCosts=env_costs,
+                assumptions=cost_breakdown_data.get("assumptions", ""),
+                costOptimizationSummary=cost_breakdown_data.get("costOptimizationSummary", ""),
+                freeTrialNotes=cost_breakdown_data.get("freeTrialNotes", "")
+            )
+
+        logger.info(f"Generated {len(scripts)} DevOps scripts for {app_name} using {iac_tool} + {cicd_platform}")
+
+        return DevOpsScriptResponse(
+            success=True,
+            message=f"Successfully generated {len(scripts)} DevOps scripts for {app_name}",
+            applicationName=app_name,
+            architectureName=arch_name,
+            cloudProvider=detected_cloud,
+            iacTool=iac_tool,
+            cicdPlatform=cicd_platform,
+            scripts=scripts,
+            executionGuide=execution_guide,
+            prerequisites=prerequisites,
+            services=services,
+            secrets=secrets,
+            costBreakdown=cost_breakdown,
+            estimatedCost=estimated_cost,
+            error=None
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating DevOps scripts: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate DevOps scripts: {str(e)}"
+        )
+
+
+# ==================== PUSH DEVOPS SCRIPTS TO REPO ====================
+
+class PushScriptsFile(BaseModel):
+    fileName: str = Field(..., description="File path inside the repo (e.g. .github/workflows/deploy.yml)")
+    content: str = Field(..., description="Raw file content")
+
+
+class PushDevOpsScriptsRequest(BaseModel):
+    token: str = Field(..., description="OAuth access token for the target provider")
+    provider: str = Field(..., description="Source control provider: github, bitbucket, azure-devops, gitlab")
+    repo_full_name: str = Field(..., description="Repository identifier (owner/repo for GitHub/Bitbucket, org/project/repo for Azure DevOps, project_id for GitLab)")
+    branch: str = Field("main", description="Target branch")
+    scripts: List[PushScriptsFile] = Field(..., description="List of files to push (from generate-devops-scripts response)")
+    commit_message: str = Field("Add DevOps pipeline and infrastructure scripts", description="Commit message")
+    # GitLab-specific
+    gitlab_url: Optional[str] = Field("https://gitlab.com", description="GitLab instance URL (GitLab only)")
+    # Azure DevOps-specific
+    organization: Optional[str] = Field(None, description="Azure DevOps organization (Azure DevOps only)")
+    project: Optional[str] = Field(None, description="Azure DevOps project (Azure DevOps only)")
+
+
+@app.post("/api/devops-scripts/push")
+async def push_devops_scripts(request: PushDevOpsScriptsRequest):
+    """
+    Push generated DevOps scripts to a repository.
+    Supports GitHub, Bitbucket, GitLab, and Azure DevOps.
+    Call this after /api/generate-devops-scripts to commit the generated files.
+    """
+    import base64 as b64
+    import re as _re
+
+    if not request.scripts:
+        raise HTTPException(status_code=422, detail="No scripts provided to push")
+
+    provider = request.provider.lower().strip()
+    results = []
+    errors = []
+
+    if provider == "github":
+        _validate_repo_full_name(request.repo_full_name)
+        gh_headers = {
+            "Authorization": f"Bearer {request.token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        import base64 as _b64_push
+
+        # Split into two buckets: regular files first, workflow files second.
+        # This guarantees all non-workflow files are committed even when the token
+        # lacks the 'workflow' OAuth scope.
+        regular_files = []
+        workflow_files = []
+        for script in request.scripts:
+            content_b64 = _b64_push.b64encode(script.content.encode()).decode()
+            entry = {"file_path": script.fileName, "content": content_b64}
+            if ".github/workflows/" in script.fileName.replace("\\", "/"):
+                workflow_files.append(entry)
+            else:
+                regular_files.append(entry)
+
+        async with httpx.AsyncClient() as client:
+            # ── Pass 1: push all regular files ──────────────────────────────
+            if regular_files:
+                try:
+                    push_result = await _github_git_api_push(
+                        client=client,
+                        gh_headers=gh_headers,
+                        repo_full_name=request.repo_full_name,
+                        branch=request.branch,
+                        files=regular_files,
+                        commit_message=request.commit_message,
+                    )
+                    pushed_set = set(push_result.get("files_pushed", []))
+                    results += [
+                        {"fileName": s.fileName, "status": "pushed"}
+                        for s in request.scripts
+                        if s.fileName in pushed_set
+                    ]
+                except HTTPException as e:
+                    errors += [{"fileName": s.fileName, "error": e.detail}
+                                for s in request.scripts if s.fileName in {f["file_path"] for f in regular_files}]
+
+            # ── Pass 2: push workflow files separately, AFTER regular files ─
+            if workflow_files:
+                try:
+                    wf_result = await _github_git_api_push(
+                        client=client,
+                        gh_headers=gh_headers,
+                        repo_full_name=request.repo_full_name,
+                        branch=request.branch,
+                        files=workflow_files,
+                        commit_message=f"{request.commit_message} [CI/CD workflows]",
+                    )
+                    pushed_set_wf = set(wf_result.get("files_pushed", []))
+                    results += [
+                        {"fileName": s.fileName, "status": "pushed"}
+                        for s in request.scripts
+                        if s.fileName in pushed_set_wf
+                    ]
+                    # Workflow files skipped inside _github_git_api_push (scope missing)
+                    for skipped in wf_result.get("skipped_workflow_files", []):
+                        errors.append({"fileName": skipped["file_path"], "error": skipped})
+                        logger.warning(
+                            f"[push-devops] '{skipped['file_path']}' skipped — "
+                            f"workflow scope missing. reauth_url provided."
+                        )
+                except _WorkflowScopeMissing as wse:
+                    logger.warning(
+                        f"[push-devops] workflow scope missing for '{wse.file_path}'"
+                    )
+                    errors += [{"fileName": f["file_path"], "error": wse.to_dict()}
+                                for f in workflow_files]
+                except HTTPException as e:
+                    errors += [{"fileName": f["file_path"], "error": e.detail}
+                                for f in workflow_files]
+
+    elif provider == "bitbucket":
+        if not _re.match(r'^[a-zA-Z0-9._\-]+/[a-zA-Z0-9._\-]+$', request.repo_full_name):
+            raise HTTPException(status_code=422, detail="repo_full_name must be 'workspace/repo_slug'")
+        parts = request.repo_full_name.split("/")
+        workspace, repo_slug = parts[0], parts[1]
+        url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src"
+        async with httpx.AsyncClient() as client:
+            for script in request.scripts:
+                try:
+                    resp = await client.post(
+                        url,
+                        data={
+                            script.fileName: script.content,
+                            "message": f"{request.commit_message}: {script.fileName}",
+                            "branch": request.branch,
+                        },
+                        headers={"Authorization": f"Bearer {request.token}"},
+                        timeout=15.0,
+                    )
+                except httpx.HTTPError:
+                    errors.append({"fileName": script.fileName, "error": "Bitbucket API unreachable"})
+                    continue
+
+                if resp.is_success or resp.status_code == 201:
+                    results.append({"fileName": script.fileName, "status": "pushed"})
+                else:
+                    err = resp.json() if resp.content else {}
+                    msg = err.get("error", {}).get("message", f"HTTP {resp.status_code}") if isinstance(err.get("error"), dict) else str(err)
+                    errors.append({"fileName": script.fileName, "error": msg})
+
+    elif provider in ("azure-devops", "azuredevops"):
+        if not request.organization or not request.project:
+            raise HTTPException(status_code=422, detail="organization and project are required for Azure DevOps")
+        if not _re.match(r'^[a-zA-Z0-9._\-]+$', request.organization):
+            raise HTTPException(status_code=422, detail="Invalid characters in organization")
+        if not _re.match(r'^[a-zA-Z0-9._\- ]+$', request.project):
+            raise HTTPException(status_code=422, detail="Invalid characters in project")
+
+        repo_name = request.repo_full_name
+        headers = {
+            "Authorization": f"Bearer {request.token}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient() as client:
+            # Get latest ref
+            refs_url = f"https://dev.azure.com/{request.organization}/{request.project}/_apis/git/repositories/{repo_name}/refs?filter=heads/{request.branch}&api-version=7.1"
+            try:
+                refs_resp = await client.get(refs_url, headers=headers, timeout=10.0)
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+            refs_data = refs_resp.json()
+            ref_list = refs_data.get("value", [])
+            old_object_id = ref_list[0]["objectId"] if ref_list else "0000000000000000000000000000000000000000"
+            change_type = "add" if old_object_id == "0000000000000000000000000000000000000000" else "edit"
+
+            # Push all files in a single commit
+            changes = []
+            for script in request.scripts:
+                changes.append({
+                    "changeType": change_type,
+                    "item": {"path": f"/{script.fileName}"},
+                    "newContent": {"content": script.content, "contentType": "rawtext"},
+                })
+
+            push_url = f"https://dev.azure.com/{request.organization}/{request.project}/_apis/git/repositories/{repo_name}/pushes?api-version=7.1"
+            push_payload = {
+                "refUpdates": [{"name": f"refs/heads/{request.branch}", "oldObjectId": old_object_id}],
+                "commits": [{"comment": request.commit_message, "changes": changes}],
+            }
+
+            try:
+                resp = await client.post(push_url, json=push_payload, headers=headers, timeout=30.0)
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+            if resp.is_success:
+                results = [{"fileName": s.fileName, "status": "pushed"} for s in request.scripts]
+            else:
+                err = resp.json() if resp.content else {}
+                raise HTTPException(status_code=resp.status_code, detail=err.get("message", "Failed to push files"))
+
+    elif provider == "gitlab":
+        gitlab_url = (request.gitlab_url or "https://gitlab.com").rstrip("/")
+        if not _re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', gitlab_url):
+            raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+
+        project_id = request.repo_full_name
+        url = f"{gitlab_url}/api/v4/projects/{project_id}/repository/commits"
+        headers = {
+            "Authorization": f"Bearer {request.token}",
+            "Content-Type": "application/json",
+        }
+
+        # GitLab supports multi-file commits natively
+        actions = []
+        for script in request.scripts:
+            actions.append({
+                "action": "create",
+                "file_path": script.fileName,
+                "content": script.content,
+            })
+
+        commit_payload = {
+            "branch": request.branch,
+            "commit_message": request.commit_message,
+            "actions": actions,
+        }
+
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.post(url, json=commit_payload, headers=headers, timeout=30.0)
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+            if resp.status_code == 400 and "already exists" in (resp.text or "").lower():
+                # Retry with "update" action for existing files
+                for action in actions:
+                    action["action"] = "update"
+                try:
+                    resp = await client.post(url, json=commit_payload, headers=headers, timeout=30.0)
+                except httpx.HTTPError:
+                    raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+            if resp.is_success:
+                results = [{"fileName": s.fileName, "status": "pushed"} for s in request.scripts]
+            else:
+                err = resp.json() if resp.content else {}
+                msg = err.get("message", "Failed to push files")
+                raise HTTPException(status_code=resp.status_code, detail=msg if isinstance(msg, str) else str(msg))
+
+    else:
+        raise HTTPException(status_code=422, detail=f"Unsupported provider '{provider}'. Use: github, bitbucket, azure-devops, gitlab")
+
+    return {
+        "success": len(errors) == 0,
+        "message": f"Pushed {len(results)}/{len(request.scripts)} files to {request.repo_full_name}",
+        "pushed": results,
+        "errors": errors,
+    }
+
+
 @app.post("/api/lld/diagram", response_model=LLDDiagramResponse)
 async def generate_lld_diagram(
     request: LLDDiagramRequest,
@@ -3358,7 +4316,7 @@ IMPORTANT:
                     {"role": "user", "content": user_prompt}
                 ],
                 response_format={"type": "json_object"},
-                max_completion_tokens=4000
+                max_completion_tokens=MAX_OUTPUT_TOKENS
             )
 
             message = completion.choices[0].message
@@ -3447,11 +4405,38 @@ class GitHubExchangeRequest(BaseModel):
     redirect_uri: str = Field(..., description="Redirect URI used in the OAuth flow")
 
 
+@app.get("/api/github/auth-url")
+async def github_auth_url(
+    redirect_uri: str,
+    state: Optional[str] = None,
+):
+    """
+    Returns the GitHub OAuth authorization URL with the correct scopes.
+    Includes 'workflow' scope so the token can write .github/workflows/ files.
+    Call this when the user needs to (re-)authorize GitHub access.
+    """
+    if not GITHUB_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID is not configured")
+
+    import urllib.parse
+    params: Dict[str, str] = {
+        "client_id": GITHUB_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "scope": "read:user repo workflow",
+    }
+    if state:
+        params["state"] = state
+    auth_url = "https://github.com/login/oauth/authorize?" + urllib.parse.urlencode(params)
+    return {"auth_url": auth_url, "scopes": "read:user repo workflow"}
+
+
 @app.post("/api/github/exchange")
 async def github_exchange(request: GitHubExchangeRequest):
     """
     Exchange a GitHub OAuth code for an access token.
     The client secret is kept server-side and never exposed to the browser.
+    If the resulting token is missing the 'workflow' scope, returns reauth_url
+    so the frontend can redirect the user to re-authorize with correct scopes.
     """
     if not GITHUB_CLIENT_SECRET or not GITHUB_CLIENT_ID:
         print(f"[GitHub] ERROR: CLIENT_ID={GITHUB_CLIENT_ID!r}, SECRET={'SET' if GITHUB_CLIENT_SECRET else 'MISSING'}")
@@ -3487,7 +4472,96 @@ async def github_exchange(request: GitHubExchangeRequest):
             detail=token_data.get("error_description", token_data["error"])
         )
 
-    return token_data
+    # --- Check scopes on the returned token ---
+    access_token = token_data.get("access_token", "")
+    token_scope = token_data.get("scope", "")
+    logger.info(f"[GitHub] Exchange: granted scopes='{token_scope}'")
+
+    if access_token and "workflow" not in token_scope:
+        import urllib.parse as _ul
+        # Fetch the GitHub username so we can add &login=<user> to the reauth URL.
+        # This forces GitHub to show the authorization page (with the new 'workflow'
+        # permission listed) instead of silently restoring the old cached token.
+        github_login: str = ""
+        try:
+            async with httpx.AsyncClient() as _uc:
+                _ur = await _uc.get(
+                    "https://api.github.com/user",
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github.v3+json"},
+                    timeout=8.0,
+                )
+                if _ur.is_success:
+                    github_login = _ur.json().get("login", "")
+        except Exception:
+            pass
+
+        params: Dict[str, str] = {
+            "client_id": GITHUB_CLIENT_ID,
+            "redirect_uri": request.redirect_uri,
+            "scope": "read:user repo workflow",
+        }
+        if github_login:
+            params["login"] = github_login  # forces GitHub to prompt for the extra scope
+        reauth_url = "https://github.com/login/oauth/authorize?" + _ul.urlencode(params)
+        logger.warning(
+            f"[GitHub] Token missing 'workflow' scope (got: '{token_scope}', "
+            f"login='{github_login}'). Returning token with reauth_url."
+        )
+        return {
+            **token_data,
+            "reauth_required": True,
+            "reauth_reason": "workflow_scope_missing",
+            "reauth_url": reauth_url,
+            "github_login": github_login,
+            "current_scopes": token_scope,
+            "required_scopes": "read:user repo workflow",
+            "message": (
+                f"Token granted (scopes: '{token_scope}'). "
+                f"The 'workflow' scope is missing — .github/workflows/ files will be skipped "
+                f"during upload until the user re-authorizes via reauth_url."
+            ),
+        }
+
+    return {**token_data, "reauth_required": False}
+
+
+@app.post("/api/github/check-scopes")
+async def github_check_scopes(body: Dict[str, str]):
+    """
+    Check whether a GitHub token has all required scopes.
+    Body: {"token": "<access_token>", "redirect_uri": "<optional>"}
+    Returns {"has_workflow_scope": bool, "scopes": str, "reauth_url": str|null}
+    """
+    token = body.get("token", "")
+    redirect_uri = body.get("redirect_uri", "")
+    if not token:
+        raise HTTPException(status_code=422, detail="token is required")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"},
+            timeout=10.0,
+        )
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub token is invalid or expired")
+
+    token_scopes = resp.headers.get("X-OAuth-Scopes", "")
+    has_workflow = "workflow" in token_scopes
+    reauth_url = None
+    if not has_workflow and GITHUB_CLIENT_ID:
+        import urllib.parse as _ul
+        p: Dict[str, str] = {"client_id": GITHUB_CLIENT_ID, "scope": "read:user repo workflow"}
+        if redirect_uri:
+            p["redirect_uri"] = redirect_uri
+        reauth_url = "https://github.com/login/oauth/authorize?" + _ul.urlencode(p)
+
+    return {
+        "has_workflow_scope": has_workflow,
+        "scopes": token_scopes,
+        "reauth_required": not has_workflow,
+        "reauth_url": reauth_url,
+    }
 
 
 class CreateRepoRequest(BaseModel):
@@ -3495,7 +4569,7 @@ class CreateRepoRequest(BaseModel):
     name: str = Field(..., description="Repository name")
     description: str = Field("", description="Repository description")
     private: bool = Field(False, description="Whether the repo is private")
-    auto_init: bool = Field(False, description="Whether to auto-initialize with README")
+    auto_init: bool = Field(True, description="Whether to auto-initialize with README")
 
 
 @app.post("/api/github/create-repo")
@@ -3513,7 +4587,7 @@ async def github_create_repo(request: CreateRepoRequest):
                     "name": request.name,
                     "description": request.description,
                     "private": request.private,
-                    "auto_init": request.auto_init,
+                    "auto_init": True,
                 },
                 headers={
                     "Authorization": f"Bearer {request.token}",
@@ -3537,47 +4611,2139 @@ async def github_create_repo(request: CreateRepoRequest):
     return response.json()
 
 
-class UploadFileRequest(BaseModel):
+# ---- GitHub secret encryption (libsodium sealed box via PyNaCl) ----
+def _encrypt_github_secret(public_key_b64: str, secret_value: str) -> str:
+    """
+    Encrypt a plaintext secret value using the repo's GitHub public key.
+    GitHub requires libsodium crypto_box_seal (PyNaCl SealedBox).
+    Returns base64-encoded ciphertext ready for the GitHub API.
+    """
+    import base64 as _b64
+    try:
+        from nacl.public import PublicKey, SealedBox
+        from nacl.encoding import RawEncoder
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="PyNaCl is required for GitHub secret encryption. Run: pip install PyNaCl>=1.5.0"
+        )
+    public_key_bytes = _b64.b64decode(public_key_b64)
+    public_key = PublicKey(public_key_bytes, encoder=RawEncoder)
+    sealed_box = SealedBox(public_key)
+    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+    return _b64.b64encode(encrypted).decode("utf-8")
+
+
+class SetSecretItem(BaseModel):
+    name: str = Field(..., description="Secret name — GitHub allows uppercase letters, digits, underscores; must not start with GITHUB_")
+    value: str = Field(..., description="Plaintext secret value (encrypted server-side before sending to GitHub; never logged or stored)")
+
+
+class SetSecretsRequest(BaseModel):
+    token: str = Field(..., description="GitHub OAuth access token (requires repo scope)")
+    repo_full_name: str = Field(..., description="owner/repo")
+    secrets: List[SetSecretItem] = Field(..., min_length=1, description="List of secrets to set")
+
+
+class SetSecretResult(BaseModel):
+    name: str
+    success: bool
+    error: Optional[str] = None
+
+
+@app.post("/api/github/set-secrets")
+async def github_set_secrets(request: SetSecretsRequest) -> Dict[str, Any]:
+    """
+    Encrypt and store one or more secrets in a GitHub repository's Actions secrets store.
+    Secret values are encrypted on the server using the repo's libsodium public key
+    before being transmitted to GitHub — they are never logged or persisted.
+    Requires a token with the 'repo' scope.
+    """
+    _validate_repo_full_name(request.repo_full_name)
+
+    # Validate secret names: GitHub allows [A-Za-z0-9_], must not start with GITHUB_
+    import re as _re_sec
+    invalid_names = [
+        s.name for s in request.secrets
+        if not _re_sec.match(r'^[A-Za-z_][A-Za-z0-9_]*$', s.name) or s.name.upper().startswith("GITHUB_")
+    ]
+    if invalid_names:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid secret name(s): {invalid_names}. Names must match [A-Za-z_][A-Za-z0-9_]* and must not start with GITHUB_."
+        )
+
+    gh_headers = {
+        "Authorization": f"Bearer {request.token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    api = f"https://api.github.com/repos/{request.repo_full_name}"
+
+    results: List[Dict[str, Any]] = []
+
+    async with httpx.AsyncClient() as client:
+        # Fetch the repo's public key (one call per request — same key used for all secrets)
+        try:
+            key_resp = await client.get(
+                f"{api}/actions/secrets/public-key",
+                headers=gh_headers,
+                timeout=10.0,
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"GitHub API error fetching public key: {str(e)}")
+
+        if key_resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="GitHub token expired or invalid")
+        if key_resp.status_code == 403:
+            raise HTTPException(status_code=403, detail="Token lacks permission to manage secrets for this repository (repo scope required)")
+        if key_resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Repository '{request.repo_full_name}' not found or token has no access")
+        if not key_resp.is_success:
+            raise HTTPException(status_code=key_resp.status_code, detail=f"Failed to fetch repo public key: {key_resp.text[:300]}")
+
+        key_data = key_resp.json()
+        repo_key_id: str = key_data["key_id"]
+        repo_public_key: str = key_data["key"]
+
+        # Encrypt and PUT each secret
+        for secret in request.secrets:
+            try:
+                encrypted_value = _encrypt_github_secret(repo_public_key, secret.value)
+                put_resp = await client.put(
+                    f"{api}/actions/secrets/{secret.name}",
+                    json={"encrypted_value": encrypted_value, "key_id": repo_key_id},
+                    headers=gh_headers,
+                    timeout=10.0,
+                )
+                if put_resp.status_code in (201, 204):
+                    results.append({"name": secret.name, "success": True, "error": None})
+                else:
+                    err_msg = put_resp.json().get("message", put_resp.text[:200]) if put_resp.content else "Unknown error"
+                    results.append({"name": secret.name, "success": False, "error": err_msg})
+            except HTTPException:
+                raise
+            except Exception as e:
+                results.append({"name": secret.name, "success": False, "error": str(e)})
+
+    succeeded = [r["name"] for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+
+    logger.info(f"[GitHub] set-secrets: repo={request.repo_full_name} set={succeeded} failed={[f['name'] for f in failed]}")
+
+    return {
+        "success": len(failed) == 0,
+        "message": f"Set {len(succeeded)}/{len(results)} secret(s) on {request.repo_full_name}",
+        "set": succeeded,
+        "failed": failed,
+    }
+
+
+
     token: str = Field(..., description="GitHub access token")
     repo_full_name: str = Field(..., description="owner/repo")
     file_path: str = Field(..., description="Path inside the repo")
     content: str = Field(..., description="Base64-encoded file content")
     message: str = Field("", description="Commit message")
+    branch: str = Field("main", description="Target branch")
+
+
+class UploadFilesRequest(BaseModel):
+    token: str = Field(..., description="GitHub access token")
+    repo_full_name: str = Field(..., description="owner/repo")
+    files: List[Dict[str, str]] = Field(..., description="List of {file_path, content} dicts. content is base64-encoded.")
+    message: str = Field("Add generated files", description="Commit message")
+    branch: str = Field("main", description="Target branch")
+
+
+class UploadFileRequest(BaseModel):
+    token: str = Field(..., description="GitHub access token")
+    repo_full_name: str = Field(..., description="owner/repo")
+    file_path: str = Field(..., description="Path of the file in the repo")
+    content: str = Field(..., description="Base64-encoded file content")
+    message: str = Field("", description="Commit message")
+    branch: str = Field("main", description="Target branch")
+
+
+async def _gh_ensure_repo_ready(
+    client: httpx.AsyncClient,
+    gh_headers: Dict[str, str],
+    api: str,
+    repo_full_name: str,
+    branch: str,
+) -> tuple:
+    """
+    Ensures the GitHub repo has at least one commit and the target branch exists.
+    Returns (parent_sha, base_tree_sha). Retries until the git database is ready.
+    """
+    import base64 as _b64_git
+
+    # ---- Step A: probe the target branch ----
+    for probe_attempt in range(8):
+        ref_resp = await client.get(
+            f"{api}/git/ref/heads/{branch}", headers=gh_headers, timeout=10.0
+        )
+        logger.info(
+            f"[GH-PUSH] {repo_full_name} branch={branch} "
+            f"probe #{probe_attempt+1}: status={ref_resp.status_code} body={ref_resp.text[:200]}"
+        )
+
+        if ref_resp.is_success:
+            parent_sha = ref_resp.json()["object"]["sha"]
+            logger.info(f"[GH-PUSH] Branch '{branch}' found, parent_sha={parent_sha}")
+
+            commit_resp = await client.get(
+                f"{api}/git/commits/{parent_sha}", headers=gh_headers, timeout=10.0
+            )
+            logger.info(
+                f"[GH-PUSH] GET commit/{parent_sha}: status={commit_resp.status_code} "
+                f"body={commit_resp.text[:200]}"
+            )
+            base_tree_sha = commit_resp.json().get("tree", {}).get("sha") if commit_resp.is_success else None
+            logger.info(f"[GH-PUSH] base_tree_sha={base_tree_sha}")
+            return parent_sha, base_tree_sha
+
+        # Branch/repo not ready yet — check if repo just has a different default branch
+        repo_info_resp = await client.get(api, headers=gh_headers, timeout=10.0)
+        if not repo_info_resp.is_success:
+            logger.warning(f"[GH-PUSH] Repo info fetch failed: {repo_info_resp.status_code}")
+            await asyncio.sleep(2 * (probe_attempt + 1))
+            continue
+
+        repo_info = repo_info_resp.json()
+        default_branch = repo_info.get("default_branch", "main")
+        logger.info(
+            f"[GH-PUSH] Repo default_branch={default_branch}, "
+            f"empty={repo_info.get('size', -1) == 0}, size={repo_info.get('size')}"
+        )
+
+        # ---- Step B: if repo is empty, create initial commit via Contents API ----
+        if repo_info.get("size", 1) == 0 or probe_attempt == 0:
+            repo_name = repo_full_name.split('/')[-1]
+            readme_b64 = _b64_git.b64encode(
+                f"# {repo_name}\n\nAuto-generated repository.\n".encode()
+            ).decode()
+            init_resp = await client.put(
+                f"{api}/contents/README.md",
+                json={"message": "Initial commit", "content": readme_b64},
+                headers=gh_headers,
+                timeout=15.0,
+            )
+            logger.info(
+                f"[GH-PUSH] README init: status={init_resp.status_code} "
+                f"body={init_resp.text[:300]}"
+            )
+            # 409/422 = already initialized by another parallel request — that's OK
+            if init_resp.status_code in (200, 201, 409, 422):
+                await asyncio.sleep(3)
+            else:
+                await asyncio.sleep(2 * (probe_attempt + 1))
+                continue
+
+        # ---- Step C: if target branch != default, create it ----
+        if default_branch != branch:
+            def_ref = await client.get(
+                f"{api}/git/ref/heads/{default_branch}", headers=gh_headers, timeout=10.0
+            )
+            logger.info(
+                f"[GH-PUSH] Default branch ref: status={def_ref.status_code} "
+                f"body={def_ref.text[:200]}"
+            )
+            if def_ref.is_success:
+                def_sha = def_ref.json()["object"]["sha"]
+                create_br = await client.post(
+                    f"{api}/git/refs",
+                    json={"ref": f"refs/heads/{branch}", "sha": def_sha},
+                    headers=gh_headers,
+                    timeout=10.0,
+                )
+                logger.info(
+                    f"[GH-PUSH] Create branch '{branch}': status={create_br.status_code} "
+                    f"body={create_br.text[:200]}"
+                )
+                await asyncio.sleep(2)
+                continue  # re-probe
+
+        await asyncio.sleep(2 * (probe_attempt + 1))
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"Repo '{repo_full_name}' git database is not ready after multiple retries. "
+            f"Check server logs for [GH-PUSH] entries for details."
+        ),
+    )
+
+
+async def _github_git_api_push(
+    client: httpx.AsyncClient,
+    gh_headers: Dict[str, str],
+    repo_full_name: str,
+    branch: str,
+    files: List[Dict[str, str]],
+    commit_message: str,
+) -> Dict[str, Any]:
+    """
+    Push one or more files to a GitHub repo using the low-level Git Data API.
+    Works reliably for ANY file path including .github/workflows/deploy.yml.
+    Handles empty repos (no commits/branches) automatically.
+    files: list of {"file_path": "...", "content": "<base64>"}.
+    """
+    api = f"https://api.github.com/repos/{repo_full_name}"
+    logger.info(
+        f"[GH-PUSH] Starting push to {repo_full_name} branch={branch} "
+        f"files={[f['file_path'] for f in files]}"
+    )
+
+    # ------------------------------------------------------------------
+    # 0. Log scopes when workflow files are present (diagnostic only).
+    #    We no longer preemptively skip — just attempt the push and let
+    #    GitHub's actual API response tell us if the scope is missing.
+    # ------------------------------------------------------------------
+    _skipped_wf: List[Dict[str, Any]] = []
+    _reauth_url_wf: str = ""
+    _token_scopes_wf: str = ""
+
+    has_workflow_files = any(
+        ".github/workflows/" in f["file_path"].replace("\\", "/") for f in files
+    )
+    if has_workflow_files:
+        scope_resp = await client.get(
+            "https://api.github.com/user", headers=gh_headers, timeout=10.0
+        )
+        _token_scopes_wf = scope_resp.headers.get("X-OAuth-Scopes", "")
+        logger.info(
+            f"[GH-PUSH] Workflow file(s) detected. Token scopes: '{_token_scopes_wf}' — attempting push anyway."
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Ensure repo is ready and get parent commit + base tree
+    # ------------------------------------------------------------------
+    parent_sha, base_tree_sha = await _gh_ensure_repo_ready(
+        client, gh_headers, api, repo_full_name, branch
+    )
+    logger.info(
+        f"[GH-PUSH] Repo ready. parent_sha={parent_sha} base_tree_sha={base_tree_sha}"
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Create blobs for every file
+    # ------------------------------------------------------------------
+    tree_items = []
+    for f in files:
+        logger.info(f"[GH-PUSH] Creating blob for '{f['file_path']}' ...")
+        blob_resp = await client.post(
+            f"{api}/git/blobs",
+            json={"content": f["content"], "encoding": "base64"},
+            headers=gh_headers,
+            timeout=15.0,
+        )
+        logger.info(
+            f"[GH-PUSH] Blob '{f['file_path']}': status={blob_resp.status_code} "
+            f"body={blob_resp.text[:200]}"
+        )
+        if not blob_resp.is_success:
+            err = blob_resp.json() if blob_resp.content else {}
+            raise HTTPException(
+                status_code=blob_resp.status_code,
+                detail=f"Failed to create blob for '{f['file_path']}': {err.get('message', blob_resp.text[:200])}",
+            )
+        blob_sha = blob_resp.json()["sha"]
+        tree_items.append({
+            "path": f["file_path"],
+            "mode": "100644",
+            "type": "blob",
+            "sha": blob_sha,
+        })
+
+    # ------------------------------------------------------------------
+    # 3. Create a new tree (retry on 404 — GitHub eventual consistency)
+    # ------------------------------------------------------------------
+    tree_payload: Dict[str, Any] = {"tree": tree_items}
+    if base_tree_sha:
+        tree_payload["base_tree"] = base_tree_sha
+
+    tree_resp = None
+    for tree_attempt in range(5):
+        logger.info(
+            f"[GH-PUSH] Creating tree attempt #{tree_attempt+1}, "
+            f"base_tree={tree_payload.get('base_tree')}, "
+            f"items={[t['path'] for t in tree_items]}"
+        )
+        tree_resp = await client.post(
+            f"{api}/git/trees",
+            json=tree_payload,
+            headers=gh_headers,
+            timeout=15.0,
+        )
+        logger.info(
+            f"[GH-PUSH] Tree response: status={tree_resp.status_code} "
+            f"body={tree_resp.text[:400]}"
+        )
+        if tree_resp.is_success:
+            break
+        # On 404: base_tree SHA not yet visible — drop it and retry without base_tree
+        if tree_resp.status_code == 404:
+            scope_resp = await client.get("https://api.github.com/user", headers=gh_headers, timeout=10.0)
+            token_scopes = scope_resp.headers.get("X-OAuth-Scopes", "unknown")
+            logger.warning(
+                f"[GH-PUSH] Tree 404 on attempt #{tree_attempt+1}. "
+                f"Token scopes='{token_scopes}'. "
+                f"base_tree={'present' if 'base_tree' in tree_payload else 'absent'}"
+            )
+            if "base_tree" in tree_payload:
+                logger.warning(
+                    f"[GH-PUSH] Retrying tree without base_tree={base_tree_sha}..."
+                )
+                tree_payload.pop("base_tree")
+                base_tree_sha = None
+                await asyncio.sleep(2 * (tree_attempt + 1))
+                continue
+        # Other error — bail
+        err = tree_resp.json() if tree_resp.content else {}
+        raise HTTPException(
+            status_code=tree_resp.status_code,
+            detail=f"Failed to create tree: {err.get('message', tree_resp.text[:300])}",
+        )
+
+    if tree_resp is None or not tree_resp.is_success:
+        err = tree_resp.json() if (tree_resp and tree_resp.content) else {}
+        raise HTTPException(
+            status_code=tree_resp.status_code if tree_resp else 500,
+            detail=f"Failed to create tree after retries: {err.get('message', 'Unknown')}",
+        )
+    new_tree_sha = tree_resp.json()["sha"]
+    logger.info(f"[GH-PUSH] Tree created: sha={new_tree_sha}")
+
+    # ------------------------------------------------------------------
+    # 4. Create a commit
+    # ------------------------------------------------------------------
+    commit_payload: Dict[str, Any] = {
+        "message": commit_message,
+        "tree": new_tree_sha,
+        "parents": [parent_sha] if parent_sha else [],
+    }
+    logger.info(f"[GH-PUSH] Creating commit with tree={new_tree_sha} parents={commit_payload['parents']}")
+    commit_resp = await client.post(
+        f"{api}/git/commits",
+        json=commit_payload,
+        headers=gh_headers,
+        timeout=15.0,
+    )
+    logger.info(
+        f"[GH-PUSH] Commit response: status={commit_resp.status_code} "
+        f"body={commit_resp.text[:300]}"
+    )
+    if not commit_resp.is_success:
+        err = commit_resp.json() if commit_resp.content else {}
+        raise HTTPException(
+            status_code=commit_resp.status_code,
+            detail=f"Failed to create commit: {err.get('message', commit_resp.text[:300])}",
+        )
+    new_commit_sha = commit_resp.json()["sha"]
+    logger.info(f"[GH-PUSH] Commit created: sha={new_commit_sha}")
+
+    # ------------------------------------------------------------------
+    # 5. Update (or create) the branch ref
+    # ------------------------------------------------------------------
+    if parent_sha:
+        ref_update = await client.patch(
+            f"{api}/git/refs/heads/{branch}",
+            json={"sha": new_commit_sha, "force": True},
+            headers=gh_headers,
+            timeout=10.0,
+        )
+    else:
+        ref_update = await client.post(
+            f"{api}/git/refs",
+            json={"ref": f"refs/heads/{branch}", "sha": new_commit_sha},
+            headers=gh_headers,
+            timeout=10.0,
+        )
+    logger.info(
+        f"[GH-PUSH] Ref update ({branch}): status={ref_update.status_code} "
+        f"body={ref_update.text[:200]}"
+    )
+    if not ref_update.is_success:
+        err = ref_update.json() if ref_update.content else {}
+        raise HTTPException(
+            status_code=ref_update.status_code,
+            detail=f"Failed to update branch ref: {err.get('message', ref_update.text[:300])}",
+        )
+
+    logger.info(
+        f"[GH-PUSH] SUCCESS: {len(files)} file(s) pushed to {repo_full_name}/{branch} "
+        f"commit={new_commit_sha}"
+    )
+    return {
+        "commit_sha": new_commit_sha,
+        "tree_sha": new_tree_sha,
+        "files_pushed": [f["file_path"] for f in files],
+        "skipped_workflow_files": [
+            {
+                "file_path": f["file_path"],
+                "reauth_required": True,
+                "reauth_reason": "workflow_scope_missing",
+                "reauth_url": _reauth_url_wf,
+                "current_scopes": _token_scopes_wf,
+                "required_scopes": "read:user repo workflow",
+                "message": "Re-authenticate with the reauth_url to gain the 'workflow' scope, then retry.",
+            }
+            for f in _skipped_wf
+        ],
+    }
 
 
 @app.post("/api/github/upload-file")
 async def github_upload_file(request: UploadFileRequest):
     """
     Upload / create a single file in a GitHub repository.
+    Uses the Git Data API (blobs→trees→commits→refs) instead of the Contents API
+    to reliably handle nested paths like .github/workflows/deploy.yml.
+    Serialized per-repo to prevent conflicts from parallel uploads.
     """
     commit_message = request.message or f"Add {request.file_path}"
-    url = f"https://api.github.com/repos/{request.repo_full_name}/contents/{request.file_path}"
+    gh_headers = {
+        "Authorization": f"Bearer {request.token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Verify repo exists
+    async with httpx.AsyncClient() as client:
+        repo_resp = await client.get(
+            f"https://api.github.com/repos/{request.repo_full_name}",
+            headers=gh_headers,
+            timeout=10.0,
+        )
+    if repo_resp.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{request.repo_full_name}' not found. Create it first via /api/github/create-repo.",
+        )
+    if repo_resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub token expired or invalid")
+
+    # Serialize per-repo so parallel uploads don't conflict
+    if request.repo_full_name not in _repo_upload_locks:
+        _repo_upload_locks[request.repo_full_name] = asyncio.Lock()
+    lock = _repo_upload_locks[request.repo_full_name]
+
+    async with lock:
+        async with httpx.AsyncClient() as client:
+            try:
+                result = await _github_git_api_push(
+                    client=client,
+                    gh_headers=gh_headers,
+                    repo_full_name=request.repo_full_name,
+                    branch=request.branch,
+                    files=[{"file_path": request.file_path, "content": request.content}],
+                    commit_message=commit_message,
+                )
+            except _WorkflowScopeMissing as wse:
+                from fastapi.responses import JSONResponse
+                logger.warning(
+                    f"[upload-file] workflow scope missing for '{request.file_path}', "
+                    f"returning 200 with reauth_required=true"
+                )
+                return JSONResponse(status_code=200, content=wse.to_dict())
+
+    return {
+        "content": {"path": request.file_path, "sha": result["commit_sha"]},
+        "commit": {"sha": result["commit_sha"], "message": commit_message},
+    }
+
+
+@app.post("/api/github/upload-files")
+async def github_upload_files(request: UploadFilesRequest):
+    """
+    Upload multiple files to a GitHub repository in a SINGLE commit.
+    Uses the Git Data API (blobs→trees→commits→refs).
+    This is faster and more reliable than calling upload-file per file.
+    """
+    if not request.files:
+        raise HTTPException(status_code=422, detail="No files provided")
+
+    gh_headers = {
+        "Authorization": f"Bearer {request.token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Verify repo exists
+    async with httpx.AsyncClient() as client:
+        repo_resp = await client.get(
+            f"https://api.github.com/repos/{request.repo_full_name}",
+            headers=gh_headers,
+            timeout=10.0,
+        )
+    if repo_resp.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository '{request.repo_full_name}' not found. Create it first via /api/github/create-repo.",
+        )
+    if repo_resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub token expired or invalid")
+
+    # Serialize per-repo
+    if request.repo_full_name not in _repo_upload_locks:
+        _repo_upload_locks[request.repo_full_name] = asyncio.Lock()
+    lock = _repo_upload_locks[request.repo_full_name]
+
+    async with lock:
+        async with httpx.AsyncClient() as client:
+            try:
+                result = await _github_git_api_push(
+                    client=client,
+                    gh_headers=gh_headers,
+                    repo_full_name=request.repo_full_name,
+                    branch=request.branch,
+                    files=request.files,
+                    commit_message=request.message,
+                )
+            except _WorkflowScopeMissing as wse:
+                from fastapi.responses import JSONResponse
+                logger.warning(
+                    f"[upload-files] workflow scope missing for '{wse.file_path}', "
+                    f"returning 200 with reauth_required=true"
+                )
+                return JSONResponse(status_code=200, content=wse.to_dict())
+
+    skipped = result.get("skipped_workflow_files", [])
+    return {
+        "success": True,
+        "commit_sha": result["commit_sha"],
+        "files_pushed": result["files_pushed"],
+        "total_files": len(request.files),
+        "skipped_workflow_files": skipped,
+    }
+
+
+# ==================== BITBUCKET OAUTH & REPO ====================
+
+class BitbucketExchangeRequest(BaseModel):
+    code: str = Field(..., description="OAuth code from Bitbucket callback")
+    redirect_uri: str = Field(..., description="Redirect URI used in the OAuth flow")
+
+
+@app.post("/api/bitbucket/exchange")
+async def bitbucket_exchange(request: BitbucketExchangeRequest):
+    """
+    Exchange a Bitbucket OAuth code for an access token.
+    Uses OAuth2 authorization code grant — client secret stays server-side.
+    """
+    if not BITBUCKET_CLIENT_ID or not BITBUCKET_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Bitbucket OAuth is not configured (missing BITBUCKET_CLIENT_ID or BITBUCKET_CLIENT_SECRET)"
+        )
+
+    logger.info(f"Bitbucket OAuth exchange: code={request.code[:8]}...")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                "https://bitbucket.org/site/oauth2/access_token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": request.code,
+                    "redirect_uri": request.redirect_uri,
+                },
+                auth=(BITBUCKET_CLIENT_ID, BITBUCKET_CLIENT_SECRET),
+                headers={"Accept": "application/json"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.error("Bitbucket token exchange failed: network error")
+            raise HTTPException(status_code=502, detail="Bitbucket OAuth API unreachable")
+
+    token_data = response.json()
+    if "error" in token_data:
+        raise HTTPException(
+            status_code=400,
+            detail=token_data.get("error_description", token_data["error"])
+        )
+
+    return token_data
+
+
+class BitbucketRefreshRequest(BaseModel):
+    refresh_token: str = Field(..., description="Bitbucket refresh token")
+
+
+@app.post("/api/bitbucket/refresh")
+async def bitbucket_refresh(request: BitbucketRefreshRequest):
+    """
+    Refresh a Bitbucket OAuth access token using the refresh token.
+    Bitbucket tokens expire after 2 hours, so this is needed for long sessions.
+    """
+    if not BITBUCKET_CLIENT_ID or not BITBUCKET_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Bitbucket OAuth is not configured (missing BITBUCKET_CLIENT_ID or BITBUCKET_CLIENT_SECRET)"
+        )
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.put(
+            response = await client.post(
+                "https://bitbucket.org/site/oauth2/access_token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": request.refresh_token,
+                },
+                auth=(BITBUCKET_CLIENT_ID, BITBUCKET_CLIENT_SECRET),
+                headers={"Accept": "application/json"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.error("Bitbucket token refresh failed: network error")
+            raise HTTPException(status_code=502, detail="Bitbucket OAuth API unreachable")
+
+    token_data = response.json()
+    if "error" in token_data:
+        raise HTTPException(
+            status_code=400,
+            detail=token_data.get("error_description", token_data["error"])
+        )
+
+    return token_data
+
+
+@app.get("/api/bitbucket/user")
+async def bitbucket_get_user(authorization: str = Header(..., description="Bearer <bitbucket_access_token>")):
+    """
+    Get the authenticated Bitbucket user profile.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <token>'")
+    token = authorization[7:]
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                "https://api.bitbucket.org/2.0/user",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Bitbucket API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Bitbucket token expired or invalid")
+    if not response.is_success:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch Bitbucket user")
+
+    return response.json()
+
+
+class BitbucketCreateRepoRequest(BaseModel):
+    token: str = Field(..., description="Bitbucket OAuth access token (from /api/bitbucket/exchange)")
+    workspace: str = Field(..., description="Bitbucket workspace slug")
+    name: str = Field(..., description="Repository name")
+    description: str = Field("", description="Repository description")
+    is_private: bool = Field(True, description="Whether the repo is private")
+    project_key: Optional[str] = Field(None, description="Project key to create the repo under")
+
+
+@app.post("/api/bitbucket/create-repo")
+async def bitbucket_create_repo(request: BitbucketCreateRepoRequest):
+    """
+    Create a Bitbucket repository on behalf of the authenticated user.
+    """
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', request.workspace):
+        raise HTTPException(status_code=422, detail="Invalid characters in workspace")
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', request.name):
+        raise HTTPException(status_code=422, detail="Invalid characters in repo name")
+
+    repo_slug = request.name.lower().replace(" ", "-")
+    url = f"https://api.bitbucket.org/2.0/repositories/{request.workspace}/{repo_slug}"
+
+    payload: Dict[str, Any] = {
+        "scm": "git",
+        "name": request.name,
+        "description": request.description,
+        "is_private": request.is_private,
+    }
+    if request.project_key:
+        payload["project"] = {"key": request.project_key}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
                 url,
-                json={"message": commit_message, "content": request.content},
+                json=payload,
                 headers={
                     "Authorization": f"Bearer {request.token}",
-                    "Accept": "application/vnd.github.v3+json",
+                    "Content-Type": "application/json",
                 },
                 timeout=15.0,
             )
-        except httpx.HTTPError as e:
-            logger.error(f"GitHub upload-file failed: {str(e)}")
-            raise HTTPException(status_code=502, detail=f"GitHub API error: {str(e)}")
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Bitbucket API unreachable")
 
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="GitHub token expired or invalid")
+        raise HTTPException(status_code=401, detail="Bitbucket token expired or invalid")
     if not response.is_success:
-        error = response.json()
+        error = response.json() if response.content else {}
+        msg = error.get("error", {}).get("message", "Failed to create repository") if isinstance(error.get("error"), dict) else str(error)
+        raise HTTPException(status_code=response.status_code, detail=msg)
+
+    return response.json()
+
+
+class BitbucketUploadFileRequest(BaseModel):
+    token: str = Field(..., description="Bitbucket OAuth access token (from /api/bitbucket/exchange)")
+    workspace: str = Field(..., description="Bitbucket workspace slug")
+    repo_slug: str = Field(..., description="Bitbucket repository slug")
+    file_path: str = Field(..., description="Path inside the repo (e.g. src/main.py)")
+    content: str = Field(..., description="Raw file content (plain text)")
+    message: str = Field("", description="Commit message")
+    branch: str = Field("main", description="Target branch")
+
+
+@app.post("/api/bitbucket/upload-file")
+async def bitbucket_upload_file(request: BitbucketUploadFileRequest):
+    """
+    Upload / commit a single file to a Bitbucket repository.
+    Uses the Bitbucket src endpoint (form-encoded file upload).
+    """
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', request.workspace):
+        raise HTTPException(status_code=422, detail="Invalid characters in workspace")
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', request.repo_slug):
+        raise HTTPException(status_code=422, detail="Invalid characters in repo_slug")
+
+    commit_message = request.message or f"Add {request.file_path}"
+    url = f"https://api.bitbucket.org/2.0/repositories/{request.workspace}/{request.repo_slug}/src"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url,
+                data={
+                    request.file_path: request.content,
+                    "message": commit_message,
+                    "branch": request.branch,
+                },
+                headers={
+                    "Authorization": f"Bearer {request.token}",
+                },
+                timeout=15.0,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Bitbucket API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Bitbucket token expired or invalid")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        msg = error.get("error", {}).get("message", f"Failed to upload {request.file_path}") if isinstance(error.get("error"), dict) else str(error)
+        raise HTTPException(status_code=response.status_code, detail=msg)
+
+    return {"success": True, "message": f"File '{request.file_path}' committed to {request.workspace}/{request.repo_slug} on branch '{request.branch}'"}
+
+
+# ==================== AZURE DEVOPS OAUTH & REPO ====================
+
+class AzureDevOpsExchangeRequest(BaseModel):
+    code: str = Field(..., description="OAuth code from Azure DevOps callback")
+    redirect_uri: str = Field(..., description="Redirect URI used in the OAuth flow")
+
+
+@app.post("/api/azure-devops/exchange")
+async def azure_devops_exchange(request: AzureDevOpsExchangeRequest):
+    """
+    Exchange an Azure DevOps OAuth code for an access token.
+    Client secret stays server-side.
+    """
+    if not AZURE_DEVOPS_CLIENT_ID or not AZURE_DEVOPS_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Azure DevOps OAuth is not configured (missing AZURE_DEVOPS_CLIENT_ID or AZURE_DEVOPS_CLIENT_SECRET)"
+        )
+
+    logger.info(f"Azure DevOps OAuth exchange: code={request.code[:8]}...")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                "https://app.vssps.visualstudio.com/oauth2/token",
+                data={
+                    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    "client_assertion": AZURE_DEVOPS_CLIENT_SECRET,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": request.code,
+                    "redirect_uri": request.redirect_uri,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.error("Azure DevOps token exchange failed: network error")
+            raise HTTPException(status_code=502, detail="Azure DevOps OAuth API unreachable")
+
+    token_data = response.json()
+    if "error" in token_data:
+        raise HTTPException(
+            status_code=400,
+            detail=token_data.get("error_description", token_data["error"])
+        )
+
+    return token_data
+
+
+class AzureDevOpsRefreshRequest(BaseModel):
+    refresh_token: str = Field(..., description="Azure DevOps refresh token")
+    redirect_uri: str = Field(..., description="Redirect URI used in the OAuth flow")
+
+
+@app.post("/api/azure-devops/refresh")
+async def azure_devops_refresh(request: AzureDevOpsRefreshRequest):
+    """
+    Refresh an Azure DevOps OAuth access token.
+    """
+    if not AZURE_DEVOPS_CLIENT_ID or not AZURE_DEVOPS_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Azure DevOps OAuth is not configured"
+        )
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                "https://app.vssps.visualstudio.com/oauth2/token",
+                data={
+                    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    "client_assertion": AZURE_DEVOPS_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "assertion": request.refresh_token,
+                    "redirect_uri": request.redirect_uri,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.error("Azure DevOps token refresh failed: network error")
+            raise HTTPException(status_code=502, detail="Azure DevOps OAuth API unreachable")
+
+    token_data = response.json()
+    if "error" in token_data:
+        raise HTTPException(
+            status_code=400,
+            detail=token_data.get("error_description", token_data["error"])
+        )
+
+    return token_data
+
+
+@app.get("/api/azure-devops/user")
+async def azure_devops_get_user(authorization: str = Header(..., description="Bearer <azure_devops_access_token>")):
+    """
+    Get the authenticated Azure DevOps user profile.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <token>'")
+    token = authorization[7:]
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Azure DevOps token expired or invalid")
+    if not response.is_success:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch Azure DevOps user")
+
+    return response.json()
+
+
+class AzureDevOpsCreateRepoRequest(BaseModel):
+    token: str = Field(..., description="Azure DevOps OAuth access token (from /api/azure-devops/exchange)")
+    organization: str = Field(..., description="Azure DevOps organization name")
+    project: str = Field(..., description="Azure DevOps project name")
+    name: str = Field(..., description="Repository name")
+
+
+@app.post("/api/azure-devops/create-repo")
+async def azure_devops_create_repo(request: AzureDevOpsCreateRepoRequest):
+    """
+    Create an Azure DevOps Git repository in a project.
+    """
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._\-]+$', request.organization):
+        raise HTTPException(status_code=422, detail="Invalid characters in organization")
+    if not _re.match(r'^[a-zA-Z0-9._\- ]+$', request.project):
+        raise HTTPException(status_code=422, detail="Invalid characters in project")
+
+    url = f"https://dev.azure.com/{request.organization}/{request.project}/_apis/git/repositories?api-version=7.1"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url,
+                json={"name": request.name},
+                headers={
+                    "Authorization": f"Bearer {request.token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Azure DevOps token expired or invalid")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=error.get("message", "Failed to create repository"),
+        )
+
+    return response.json()
+
+
+class AzureDevOpsUploadFileRequest(BaseModel):
+    token: str = Field(..., description="Azure DevOps OAuth access token (from /api/azure-devops/exchange)")
+    organization: str = Field(..., description="Azure DevOps organization name")
+    project: str = Field(..., description="Azure DevOps project name")
+    repo_name: str = Field(..., description="Repository name")
+    file_path: str = Field(..., description="Path inside the repo (e.g. src/main.py)")
+    content: str = Field(..., description="Raw file content (plain text)")
+    message: str = Field("", description="Commit message")
+    branch: str = Field("main", description="Target branch")
+
+
+@app.post("/api/azure-devops/upload-file")
+async def azure_devops_upload_file(request: AzureDevOpsUploadFileRequest):
+    """
+    Push a single file to an Azure DevOps Git repository via the Pushes API.
+    """
+    import re as _re
+    import base64
+    if not _re.match(r'^[a-zA-Z0-9._\-]+$', request.organization):
+        raise HTTPException(status_code=422, detail="Invalid characters in organization")
+    if not _re.match(r'^[a-zA-Z0-9._\- ]+$', request.project):
+        raise HTTPException(status_code=422, detail="Invalid characters in project")
+
+    commit_message = request.message or f"Add {request.file_path}"
+
+    # First, get the latest commit on the branch to use as oldObjectId
+    refs_url = f"https://dev.azure.com/{request.organization}/{request.project}/_apis/git/repositories/{request.repo_name}/refs?filter=heads/{request.branch}&api-version=7.1"
+    headers = {
+        "Authorization": f"Bearer {request.token}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            refs_resp = await client.get(refs_url, headers=headers, timeout=10.0)
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+        if refs_resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="Azure DevOps token expired or invalid")
+
+        refs_data = refs_resp.json()
+        ref_list = refs_data.get("value", [])
+        old_object_id = ref_list[0]["objectId"] if ref_list else "0000000000000000000000000000000000000000"
+
+        # Push the file
+        push_url = f"https://dev.azure.com/{request.organization}/{request.project}/_apis/git/repositories/{request.repo_name}/pushes?api-version=7.1"
+        content_b64 = base64.b64encode(request.content.encode()).decode()
+        change_type = "add" if old_object_id == "0000000000000000000000000000000000000000" else "edit"
+
+        push_payload = {
+            "refUpdates": [{"name": f"refs/heads/{request.branch}", "oldObjectId": old_object_id}],
+            "commits": [{
+                "comment": commit_message,
+                "changes": [{
+                    "changeType": change_type,
+                    "item": {"path": f"/{request.file_path}"},
+                    "newContent": {"content": request.content, "contentType": "rawtext"},
+                }]
+            }]
+        }
+
+        try:
+            response = await client.post(push_url, json=push_payload, headers=headers, timeout=15.0)
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Azure DevOps token expired or invalid")
+    if not response.is_success:
+        error = response.json() if response.content else {}
         raise HTTPException(
             status_code=response.status_code,
             detail=error.get("message", f"Failed to upload {request.file_path}"),
         )
 
     return response.json()
+
+
+# ==================== GITLAB OAUTH & REPO ====================
+
+class GitLabExchangeRequest(BaseModel):
+    code: str = Field(..., description="OAuth code from GitLab callback")
+    redirect_uri: str = Field(..., description="Redirect URI used in the OAuth flow")
+    gitlab_url: str = Field("https://gitlab.com", description="GitLab instance URL")
+
+
+@app.post("/api/gitlab/exchange")
+async def gitlab_exchange(request: GitLabExchangeRequest):
+    """
+    Exchange a GitLab OAuth code for an access token.
+    Client secret stays server-side.
+    """
+    if not GITLAB_CLIENT_ID or not GITLAB_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="GitLab OAuth is not configured (missing GITLAB_CLIENT_ID or GITLAB_CLIENT_SECRET)"
+        )
+
+    import re as _re
+    if not _re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', request.gitlab_url.rstrip("/")):
+        raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+    base_url = request.gitlab_url.rstrip("/")
+
+    logger.info(f"GitLab OAuth exchange: code={request.code[:8]}...")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{base_url}/oauth/token",
+                data={
+                    "client_id": GITLAB_CLIENT_ID,
+                    "client_secret": GITLAB_CLIENT_SECRET,
+                    "code": request.code,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": request.redirect_uri,
+                },
+                headers={"Accept": "application/json"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.error("GitLab token exchange failed: network error")
+            raise HTTPException(status_code=502, detail="GitLab OAuth API unreachable")
+
+    token_data = response.json()
+    if "error" in token_data:
+        raise HTTPException(
+            status_code=400,
+            detail=token_data.get("error_description", token_data["error"])
+        )
+
+    return token_data
+
+
+class GitLabRefreshRequest(BaseModel):
+    refresh_token: str = Field(..., description="GitLab refresh token")
+    gitlab_url: str = Field("https://gitlab.com", description="GitLab instance URL")
+
+
+@app.post("/api/gitlab/refresh")
+async def gitlab_refresh(request: GitLabRefreshRequest):
+    """
+    Refresh a GitLab OAuth access token.
+    """
+    if not GITLAB_CLIENT_ID or not GITLAB_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="GitLab OAuth is not configured")
+
+    import re as _re
+    if not _re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', request.gitlab_url.rstrip("/")):
+        raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+    base_url = request.gitlab_url.rstrip("/")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{base_url}/oauth/token",
+                data={
+                    "client_id": GITLAB_CLIENT_ID,
+                    "client_secret": GITLAB_CLIENT_SECRET,
+                    "refresh_token": request.refresh_token,
+                    "grant_type": "refresh_token",
+                    "redirect_uri": "",
+                },
+                headers={"Accept": "application/json"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.error("GitLab token refresh failed: network error")
+            raise HTTPException(status_code=502, detail="GitLab OAuth API unreachable")
+
+    token_data = response.json()
+    if "error" in token_data:
+        raise HTTPException(
+            status_code=400,
+            detail=token_data.get("error_description", token_data["error"])
+        )
+
+    return token_data
+
+
+@app.get("/api/gitlab/user")
+async def gitlab_get_user(
+    authorization: str = Header(..., description="Bearer <gitlab_access_token>"),
+    gitlab_url: str = "https://gitlab.com",
+):
+    """
+    Get the authenticated GitLab user profile.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <token>'")
+    token = authorization[7:]
+
+    import re as _re
+    if not _re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', gitlab_url.rstrip("/")):
+        raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+    base_url = gitlab_url.rstrip("/")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{base_url}/api/v4/user",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitLab token expired or invalid")
+    if not response.is_success:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch GitLab user")
+
+    return response.json()
+
+
+class GitLabCreateRepoRequest(BaseModel):
+    token: str = Field(..., description="GitLab OAuth access token (from /api/gitlab/exchange)")
+    name: str = Field(..., description="Repository (project) name")
+    description: str = Field("", description="Repository description")
+    visibility: str = Field("private", description="Visibility: private, internal, or public")
+    namespace_id: Optional[int] = Field(None, description="Namespace/group ID to create under (defaults to user namespace)")
+    initialize_with_readme: bool = Field(False, description="Whether to initialize with a README")
+    gitlab_url: str = Field("https://gitlab.com", description="GitLab instance URL")
+
+
+@app.post("/api/gitlab/create-repo")
+async def gitlab_create_repo(request: GitLabCreateRepoRequest):
+    """
+    Create a GitLab project (repository).
+    """
+    import re as _re
+    if not _re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', request.gitlab_url.rstrip("/")):
+        raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+    base_url = request.gitlab_url.rstrip("/")
+
+    if request.visibility not in ("private", "internal", "public"):
+        raise HTTPException(status_code=422, detail="visibility must be 'private', 'internal', or 'public'")
+
+    payload: Dict[str, Any] = {
+        "name": request.name,
+        "description": request.description,
+        "visibility": request.visibility,
+        "initialize_with_readme": request.initialize_with_readme,
+    }
+    if request.namespace_id:
+        payload["namespace_id"] = request.namespace_id
+
+    url = f"{base_url}/api/v4/projects"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {request.token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitLab token expired or invalid")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        msg = error.get("message", "Failed to create project")
+        raise HTTPException(status_code=response.status_code, detail=msg if isinstance(msg, str) else str(msg))
+
+    return response.json()
+
+
+class GitLabUploadFileRequest(BaseModel):
+    token: str = Field(..., description="GitLab OAuth access token (from /api/gitlab/exchange)")
+    project_id: int = Field(..., description="GitLab project ID")
+    file_path: str = Field(..., description="Path inside the repo (e.g. src/main.py)")
+    content: str = Field(..., description="Raw file content (plain text)")
+    message: str = Field("", description="Commit message")
+    branch: str = Field("main", description="Target branch")
+    gitlab_url: str = Field("https://gitlab.com", description="GitLab instance URL")
+
+
+@app.post("/api/gitlab/upload-file")
+async def gitlab_upload_file(request: GitLabUploadFileRequest):
+    """
+    Create or update a single file in a GitLab repository via the Repository Files API.
+    """
+    import re as _re
+    import urllib.parse
+    if not _re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', request.gitlab_url.rstrip("/")):
+        raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+    base_url = request.gitlab_url.rstrip("/")
+
+    commit_message = request.message or f"Add {request.file_path}"
+    encoded_path = urllib.parse.quote(request.file_path, safe="")
+    url = f"{base_url}/api/v4/projects/{request.project_id}/repository/files/{encoded_path}"
+    headers = {
+        "Authorization": f"Bearer {request.token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "branch": request.branch,
+        "content": request.content,
+        "commit_message": commit_message,
+    }
+
+    async with httpx.AsyncClient() as client:
+        # Try create first; if file exists, update instead
+        try:
+            response = await client.post(url, json=payload, headers=headers, timeout=15.0)
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+        if response.status_code == 400 and "already exists" in (response.text or "").lower():
+            try:
+                response = await client.put(url, json=payload, headers=headers, timeout=15.0)
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitLab token expired or invalid")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        msg = error.get("message", f"Failed to upload {request.file_path}")
+        raise HTTPException(status_code=response.status_code, detail=msg if isinstance(msg, str) else str(msg))
+
+    return response.json()
+
+
+# ==================== CI/CD PIPELINE TRIGGERS ====================
+
+import re
+
+def _validate_path_segment(value: str, field_name: str) -> str:
+    """Validate that a value is a safe path segment (no traversal or injection)."""
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', value):
+        raise HTTPException(status_code=422, detail=f"Invalid characters in {field_name}")
+    return value
+
+
+def _validate_repo_full_name(value: str) -> str:
+    """Validate owner/repo format."""
+    if not re.match(r'^[a-zA-Z0-9._\-]+/[a-zA-Z0-9._\-]+$', value):
+        raise HTTPException(status_code=422, detail="repo_full_name must be in 'owner/repo' format with safe characters")
+    return value
+
+
+async def _get_github_user(token: str) -> Dict[str, Any]:
+    """Fetch the authenticated GitHub user to validate the token."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"},
+            timeout=10.0,
+        )
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub token expired or invalid. Please re-authenticate via GitHub OAuth.")
+    if not resp.is_success:
+        raise HTTPException(status_code=resp.status_code, detail="Failed to verify GitHub identity")
+    return resp.json()
+
+
+class GitHubActionsTriggerRequest(BaseModel):
+    token: str = Field(..., description="GitHub OAuth access token (from /api/github/exchange)")
+    repo_full_name: str = Field(..., description="owner/repo")
+    workflow_id: str = Field(..., description="Workflow file name (e.g. deploy.yml) or workflow ID")
+    ref: str = Field("main", description="Git branch or tag to run the workflow on")
+    inputs: Optional[Dict[str, str]] = Field(default=None, description="Workflow input parameters")
+
+
+@app.post("/api/pipeline/github-actions/trigger")
+async def trigger_github_actions(request: GitHubActionsTriggerRequest):
+    """
+    Trigger a GitHub Actions workflow dispatch event.
+    Uses the same OAuth token obtained from /api/github/exchange.
+    If the workflow file doesn't exist in the repo, it auto-creates a default one.
+    """
+    _validate_repo_full_name(request.repo_full_name)
+    _validate_path_segment(request.workflow_id, "workflow_id")
+
+    # Verify the token is valid by fetching the user
+    user = await _get_github_user(request.token)
+    logger.info(f"Pipeline trigger by GitHub user: {user.get('login')}")
+
+    gh_headers = {
+        "Authorization": f"Bearer {request.token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    async with httpx.AsyncClient() as client:
+        # Step 1: Check if repo exists
+        repo_resp = await client.get(
+            f"https://api.github.com/repos/{request.repo_full_name}",
+            headers=gh_headers,
+            timeout=10.0,
+        )
+        if repo_resp.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Repository '{request.repo_full_name}' not found or you don't have access."
+            )
+
+        # Step 2: Check if workflow file exists
+        workflow_path = f".github/workflows/{request.workflow_id}"
+        file_resp = await client.get(
+            f"https://api.github.com/repos/{request.repo_full_name}/contents/{workflow_path}",
+            headers=gh_headers,
+            params={"ref": request.ref},
+            timeout=10.0,
+        )
+
+        if file_resp.status_code == 404:
+            # Auto-create a default workflow with workflow_dispatch trigger
+            import base64
+            default_workflow = f"""name: {request.workflow_id.replace('.yml', '').replace('.yaml', '').replace('-', ' ').title()}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Display trigger info
+        run: |
+          echo "Triggered by: ${{{{ github.actor }}}}"
+          echo "Environment: ${{{{ github.event.inputs.environment }}}}"
+          echo "Branch: ${{{{ github.ref_name }}}}"
+          echo "Repository: ${{{{ github.repository }}}}"
+
+      - name: Deploy
+        run: |
+          echo "Deploying to ${{{{ github.event.inputs.environment }}}} environment..."
+          echo "Add your deployment steps here"
+"""
+            content_b64 = base64.b64encode(default_workflow.encode()).decode()
+            create_resp = await client.put(
+                f"https://api.github.com/repos/{request.repo_full_name}/contents/{workflow_path}",
+                json={
+                    "message": f"Add {request.workflow_id} workflow with workflow_dispatch trigger",
+                    "content": content_b64,
+                    "branch": request.ref,
+                },
+                headers=gh_headers,
+                timeout=15.0,
+            )
+            if not create_resp.is_success:
+                error = create_resp.json() if create_resp.content else {}
+                raise HTTPException(
+                    status_code=create_resp.status_code,
+                    detail=f"Workflow '{request.workflow_id}' not found and auto-create failed: {error.get('message', 'Unknown error')}",
+                )
+            logger.info(f"Auto-created workflow '{workflow_path}' in {request.repo_full_name}")
+
+            # GitHub needs a moment to index the new workflow — return success with info
+            return {
+                "success": True,
+                "message": f"Workflow '{request.workflow_id}' was created in {request.repo_full_name}. It will be available to trigger in a few seconds. Please retry the trigger.",
+                "workflowCreated": True,
+                "triggeredBy": user.get("login"),
+            }
+
+        # Step 3: Trigger the workflow dispatch
+        dispatch_url = f"https://api.github.com/repos/{request.repo_full_name}/actions/workflows/{request.workflow_id}/dispatches"
+        dispatch_payload: Dict[str, Any] = {"ref": request.ref}
+        if request.inputs:
+            dispatch_payload["inputs"] = request.inputs
+
+        try:
+            response = await client.post(
+                dispatch_url,
+                json=dispatch_payload,
+                headers=gh_headers,
+                timeout=15.0,
+            )
+        except httpx.HTTPError:
+            logger.error("GitHub Actions trigger failed: network error")
+            raise HTTPException(status_code=502, detail="GitHub API unreachable")
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workflow '{request.workflow_id}' exists but cannot be triggered. Ensure it has 'on: workflow_dispatch' in the YAML."
+        )
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        raise HTTPException(status_code=response.status_code, detail=error.get("message", "Failed to trigger workflow"))
+
+    return {"success": True, "message": f"GitHub Actions workflow '{request.workflow_id}' triggered on '{request.ref}'", "workflowCreated": False, "triggeredBy": user.get("login")}
+
+
+class AzureDevOpsTriggerRequest(BaseModel):
+    token: str = Field(..., description="GitHub OAuth access token (from /api/github/exchange) — used to verify user identity")
+    organization: str = Field(..., description="Azure DevOps organization name")
+    project: str = Field(..., description="Azure DevOps project name")
+    pipeline_id: int = Field(..., description="Pipeline definition ID")
+    branch: str = Field("main", description="Source branch to build")
+    parameters: Optional[Dict[str, str]] = Field(default=None, description="Pipeline parameters")
+
+
+@app.post("/api/pipeline/azure-devops/trigger")
+async def trigger_azure_devops(request: AzureDevOpsTriggerRequest):
+    """
+    Trigger an Azure DevOps pipeline run.
+    Uses the GitHub OAuth token to verify user identity, and server-side
+    env var AZURE_DEVOPS_PAT for Azure DevOps authentication.
+    """
+    import base64
+    # Verify user identity via GitHub OAuth token
+    user = await _get_github_user(request.token)
+    logger.info(f"Azure DevOps pipeline trigger by GitHub user: {user.get('login')}")
+
+    # Use server-side PAT — never sent by the client
+    azure_pat = os.getenv("AZURE_DEVOPS_PAT")
+    if not azure_pat:
+        raise HTTPException(status_code=500, detail="Azure DevOps integration not configured (AZURE_DEVOPS_PAT missing)")
+
+    _validate_path_segment(request.organization, "organization")
+    _validate_path_segment(request.project, "project")
+
+    url = f"https://dev.azure.com/{request.organization}/{request.project}/_apis/pipelines/{request.pipeline_id}/runs?api-version=7.1"
+    payload: Dict[str, Any] = {
+        "resources": {
+            "repositories": {
+                "self": {"refName": f"refs/heads/{request.branch}"}
+            }
+        }
+    }
+    if request.parameters:
+        payload["templateParameters"] = request.parameters
+
+    auth = base64.b64encode(f":{azure_pat}".encode()).decode()
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Basic {auth}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        except httpx.HTTPError as e:
+            logger.error("Azure DevOps trigger failed: network error")
+            raise HTTPException(status_code=502, detail="Azure DevOps API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Azure DevOps PAT expired or invalid")
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Pipeline not found. Check organization, project, and pipeline ID.")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        raise HTTPException(status_code=response.status_code, detail=error.get("message", "Failed to trigger pipeline"))
+
+    data = response.json()
+    return {"success": True, "message": f"Azure DevOps pipeline {request.pipeline_id} triggered", "triggeredBy": user.get("login"), "runId": data.get("id"), "url": data.get("_links", {}).get("web", {}).get("href", "")}
+
+
+class GitLabCITriggerRequest(BaseModel):
+    token: str = Field(..., description="GitHub OAuth access token (from /api/github/exchange) — used to verify user identity")
+    gitlab_url: str = Field("https://gitlab.com", description="GitLab instance URL")
+    project_id: int = Field(..., description="GitLab project ID")
+    ref: str = Field("main", description="Branch or tag name")
+    variables: Optional[Dict[str, str]] = Field(default=None, description="Pipeline variables")
+
+
+@app.post("/api/pipeline/gitlab-ci/trigger")
+async def trigger_gitlab_ci(request: GitLabCITriggerRequest):
+    """
+    Trigger a GitLab CI/CD pipeline.
+    Uses GitHub OAuth token to verify user identity, and server-side
+    env var GITLAB_TRIGGER_TOKEN for GitLab authentication.
+    """
+    # Verify user identity via GitHub OAuth token
+    user = await _get_github_user(request.token)
+    logger.info(f"GitLab CI pipeline trigger by GitHub user: {user.get('login')}")
+
+    # Use server-side trigger token — never sent by the client
+    gitlab_token = os.getenv("GITLAB_TRIGGER_TOKEN")
+    if not gitlab_token:
+        raise HTTPException(status_code=500, detail="GitLab integration not configured (GITLAB_TRIGGER_TOKEN missing)")
+
+    # Validate gitlab_url is a proper HTTPS URL
+    if not re.match(r'^https://[a-zA-Z0-9._\-]+(:[0-9]+)?$', request.gitlab_url.rstrip("/")):
+        raise HTTPException(status_code=422, detail="gitlab_url must be a valid HTTPS URL")
+    base_url = request.gitlab_url.rstrip("/")
+
+    url = f"{base_url}/api/v4/projects/{request.project_id}/trigger/pipeline"
+    form_data: Dict[str, str] = {"token": gitlab_token, "ref": request.ref}
+    if request.variables:
+        for key, val in request.variables.items():
+            form_data[f"variables[{key}]"] = val
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, data=form_data, timeout=15.0)
+        except httpx.HTTPError as e:
+            logger.error("GitLab CI trigger failed: network error")
+            raise HTTPException(status_code=502, detail="GitLab API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitLab trigger token expired or invalid")
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Project not found. Check project ID and permissions.")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        raise HTTPException(status_code=response.status_code, detail=error.get("message", {}) if isinstance(error.get("message"), str) else str(error))
+
+    data = response.json()
+    return {"success": True, "message": f"GitLab CI pipeline triggered on '{request.ref}'", "triggeredBy": user.get("login"), "pipelineId": data.get("id"), "url": data.get("web_url", "")}
+
+
+class BitbucketPipelineTriggerRequest(BaseModel):
+    token: str = Field(..., description="GitHub OAuth access token (from /api/github/exchange) — used to verify user identity")
+    workspace: str = Field(..., description="Bitbucket workspace slug")
+    repo_slug: str = Field(..., description="Bitbucket repository slug")
+    branch: str = Field("main", description="Branch to run the pipeline on")
+    variables: Optional[List[Dict[str, str]]] = Field(default=None, description="Pipeline variables [{key, value, secured}]")
+
+
+@app.post("/api/pipeline/bitbucket/trigger")
+async def trigger_bitbucket_pipeline(request: BitbucketPipelineTriggerRequest):
+    """
+    Trigger a Bitbucket Pipelines run.
+    Uses GitHub OAuth token to verify user identity, and server-side
+    env var BITBUCKET_ACCESS_TOKEN (OAuth2 token) for Bitbucket auth.
+    """
+    # Verify user identity via GitHub OAuth token
+    user = await _get_github_user(request.token)
+    logger.info(f"Bitbucket pipeline trigger by GitHub user: {user.get('login')}")
+
+    # Use server-side OAuth2 access token — no username/password
+    bb_token = os.getenv("BITBUCKET_ACCESS_TOKEN")
+    if not bb_token:
+        raise HTTPException(status_code=500, detail="Bitbucket integration not configured (BITBUCKET_ACCESS_TOKEN missing)")
+
+    _validate_path_segment(request.workspace, "workspace")
+    _validate_path_segment(request.repo_slug, "repo_slug")
+
+    url = f"https://api.bitbucket.org/2.0/repositories/{request.workspace}/{request.repo_slug}/pipelines/"
+    payload: Dict[str, Any] = {
+        "target": {
+            "ref_type": "branch",
+            "type": "pipeline_ref_target",
+            "ref_name": request.branch,
+        }
+    }
+    if request.variables:
+        payload["variables"] = request.variables
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {bb_token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+        except httpx.HTTPError as e:
+            logger.error("Bitbucket pipeline trigger failed: network error")
+            raise HTTPException(status_code=502, detail="Bitbucket API unreachable")
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Bitbucket credentials invalid")
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Repository not found. Check workspace and repo slug.")
+    if not response.is_success:
+        error = response.json() if response.content else {}
+        msg = error.get("error", {}).get("message", "Failed to trigger pipeline") if isinstance(error.get("error"), dict) else str(error)
+        raise HTTPException(status_code=response.status_code, detail=msg)
+
+    data = response.json()
+    return {"success": True, "message": f"Bitbucket pipeline triggered on '{request.branch}'", "triggeredBy": user.get("login"), "pipelineUuid": data.get("uuid", ""), "buildNumber": data.get("build_number", "")}
+
+
+# ==================== ANALYZE REQUIREMENTS (OpenAI) ====================
+
+class AnalyzeRequirementsRequest(BaseModel):
+    requirementText: str = Field(..., min_length=1, max_length=10000, description="Raw requirement text to analyze")
+    applicationName: str = Field("Untitled", description="Application name")
+    tenantId: str = Field("anonymous", description="Tenant ID")
+    sessionId: str = Field("", description="Session ID")
+
+
+@app.post("/api/requirements/analyze")
+async def analyze_requirements(request: AnalyzeRequirementsRequest):
+    """
+    Analyze raw requirement text using OpenAI (single call, streamed field-by-field).
+    Returns SSE events for each field as it completes:
+      data: {"field": "thinking"}
+      data: {"field": "industry", "data": [...]}
+      data: {"field": "useCases", "data": [...]}
+      data: {"field": "featuresList", "data": [...]}
+      data: {"field": "businessRequirements", "data": [...]}
+      data: {"field": "userTypes", "data": [...]}
+      data: {"field": "security", "data": [...]}
+      data: {"field": "error", "detail": "..."} on failure
+    """
+    import time
+
+    if not OPENAI_API_KEY or not OPENAI_ENDPOINT:
+        raise HTTPException(status_code=500, detail="OpenAI not configured")
+
+    session_id = request.sessionId or f"session_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
+    now = datetime.utcnow()
+
+    system_prompt = (
+        "Extract structured info from requirement text. Return ONLY a JSON object.\n"
+        "First determine the projectType and applicationType, then include ONLY the keys that are relevant for that type of application. "
+        "You may add any additional keys that provide useful context. Skip keys that don't apply.\n\n"
+        "Always include:\n"
+        "- projectType (string): 'New Development', 'Enhancement', 'Migration', 'Modernization', 'Re-architecture', 'Integration', or 'Maintenance'.\n"
+        "- applicationType (string): 'Web Application', 'Mobile App', 'Desktop Application', 'REST API / Backend Service', "
+        "'SPA', 'PWA', 'Microservices', 'CLI Tool', 'Embedded System', 'Data Pipeline', or other. Infer from context.\n"
+        "- industry (string[]): relevant industries/domains.\n\n"
+        "Then include keys based on what fits the application type:\n"
+        "FOR WEB/MOBILE/DESKTOP APPS (apps with UI):\n"
+        "- useCases, featuresList, businessRequirements, userTypes\n"
+        "- screens: {totalCount, screenList: [{name, type, description}], flow: string[]}\n"
+        "- userFlows (string[]): key user journeys e.g. 'User registers -> verifies email -> completes profile -> lands on dashboard'\n"
+        "- accessibilityNeeds (string[]): any accessibility requirements (WCAG, screen reader support, etc.)\n\n"
+        "FOR APIs / BACKEND SERVICES:\n"
+        "- endpoints (array of {method, path, description}): key API endpoints\n"
+        "- dataEntities (string[]): key data models/entities\n"
+        "- businessRules (string[]): business logic and validation rules\n"
+        "- authStrategy (string): authentication approach (OAuth2, API Key, JWT, etc.)\n\n"
+        "FOR DATA PIPELINES / ETL:\n"
+        "- dataSources (string[]): input data sources\n"
+        "- dataDestinations (string[]): output targets\n"
+        "- transformations (string[]): key data transformations\n"
+        "- scheduleFrequency (string): how often the pipeline runs\n\n"
+        "FOR MICROSERVICES:\n"
+        "- services (array of {name, responsibility, communicatesWith: string[]}): microservice breakdown\n"
+        "- messagingPatterns (string[]): event-driven, queue-based, sync REST, etc.\n\n"
+        "FOR MIGRATIONS / MODERNIZATION:\n"
+        "- sourceSystem (string): what's being migrated from\n"
+        "- targetSystem (string): what's being migrated to\n"
+        "- migrationStrategy (string): lift-and-shift, re-platform, re-architect, etc.\n"
+        "- risksAndChallenges (string[]): identified risks\n\n"
+        "COMMON (include for any type if applicable):\n"
+        "- featuresList, businessRequirements, userTypes\n"
+        "- integrations (string[]): external systems/APIs to integrate with\n"
+        "- dataEntities (string[]): key data models\n"
+        "- nonFunctionalRequirements (string[]): performance, scalability, compliance\n"
+        "- constraints (string[]): technical/business constraints\n"
+        "- assumptions (string[]): assumptions made during analysis\n"
+        "\nDo NOT include any technology stack suggestions or recommendations. Focus purely on requirements analysis.\n"
+        "Be concise. Derive everything from the requirement text. Do not fabricate. "
+        "Omit any key that doesn't apply."
+    )
+
+    # Known fields to try extracting during streaming (order matters for progressive emit).
+    # Any additional keys OpenAI returns will be emitted after streaming completes.
+    KNOWN_FIELDS = [
+        "projectType", "applicationType", "industry",
+        "useCases", "featuresList", "businessRequirements", "userTypes",
+        "screens", "userFlows", "accessibilityNeeds",
+        "endpoints", "dataEntities", "businessRules", "authStrategy",
+        "dataSources", "dataDestinations", "transformations", "scheduleFrequency",
+        "services", "messagingPatterns",
+        "sourceSystem", "targetSystem", "migrationStrategy", "risksAndChallenges",
+        "integrations", "nonFunctionalRequirements", "constraints",
+        "assumptions",
+    ]
+
+    def try_extract_value(text, key):
+        """Extract a complete JSON value for a top-level key from accumulated tokens."""
+        search = f'"{key}"'
+        idx = text.find(search)
+        if idx == -1:
+            return None
+        val_start = text.find(":", idx + len(search))
+        if val_start == -1:
+            return None
+        val_start += 1
+        while val_start < len(text) and text[val_start] in " \t\n\r":
+            val_start += 1
+        if val_start >= len(text):
+            return None
+
+        ch = text[val_start]
+        if ch == '"':
+            i = val_start + 1
+            while i < len(text):
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    try:
+                        return json.loads(text[val_start:i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        return None
+                i += 1
+            return None
+        elif ch in ('{', '['):
+            close = '}' if ch == '{' else ']'
+            depth = 0
+            in_str = False
+            i = val_start
+            while i < len(text):
+                c = text[i]
+                if in_str:
+                    if c == '\\':
+                        i += 2
+                        continue
+                    if c == '"':
+                        in_str = False
+                else:
+                    if c == '"':
+                        in_str = True
+                    elif c == ch:
+                        depth += 1
+                    elif c == close:
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                return json.loads(text[val_start:i + 1])
+                            except (json.JSONDecodeError, ValueError):
+                                return None
+                i += 1
+            return None
+        return None
+
+    async def event_stream():
+        start = time.time()
+        yield f"data: {json.dumps({'field': 'thinking'})}\n\n"
+
+        accumulated = ""
+        emitted = set()
+
+        try:
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_ENDPOINT)
+            stream = await client.chat.completions.create(
+                model=OPENAI_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": request.requirementText[:4000]},
+                ],
+                max_completion_tokens=MAX_OUTPUT_TOKENS,
+                reasoning_effort="low",
+                response_format={"type": "json_object"},
+                stream=True,
+            )
+            async for event in stream:
+                if event.choices and event.choices[0].delta.content:
+                    accumulated += event.choices[0].delta.content
+
+                    for key in KNOWN_FIELDS:
+                        if key not in emitted:
+                            val = try_extract_value(accumulated, key)
+                            if val is not None:
+                                emitted.add(key)
+                                yield f"data: {json.dumps({'field': key, 'data': val})}\n\n"
+
+            if not accumulated:
+                yield f"data: {json.dumps({'field': 'error', 'detail': 'OpenAI returned empty content'})}\n\n"
+                return
+
+            parsed = json.loads(accumulated)
+        except json.JSONDecodeError:
+            logger.error(f"Analyze: invalid JSON. Raw: {accumulated[:500]}")
+            yield f"data: {json.dumps({'field': 'error', 'detail': 'OpenAI returned invalid JSON'})}\n\n"
+            return
+        except Exception as e:
+            logger.error(f"OpenAI analyze error: {e}")
+            yield f"data: {json.dumps({'field': 'error', 'detail': str(e)})}\n\n"
+            return
+
+        # Emit any fields missed during streaming — both known and any extra keys OpenAI added
+        for key, val in parsed.items():
+            if key not in emitted:
+                yield f"data: {json.dumps({'field': key, 'data': val})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ==================== FRONTEND DESIGN GENERATION (OpenAI) ====================
+
+class FrontendDesignRequest(BaseModel):
+    """Request model for generating frontend UI design"""
+    tenantId: str = Field(default="anonymous", description="Tenant ID")
+    sessionId: str = Field(default="", description="Session ID")
+    applicationName: str = Field(..., description="Application name")
+    overview: str = Field(..., min_length=1, max_length=10000, description="Application overview / requirements")
+    screens: Optional[List[Dict[str, Any]]] = Field(default=None, description="Screen list from analyze endpoint (name, type, description)")
+    screenFlow: Optional[List[str]] = Field(default=None, description="Screen flow / navigation paths")
+    features: Optional[List[str]] = Field(default=None, description="Application features")
+    userTypes: Optional[List[str]] = Field(default=None, description="Types of users")
+    industry: Optional[str] = Field(default=None, description="Industry / domain")
+    applicationType: Optional[str] = Field(default=None, description="App type e.g. SPA, PWA, Mobile")
+    theme: Optional[str] = Field(default="modern", description="Design theme: modern, minimal, corporate, vibrant")
+
+
+@app.post("/api/design/frontend")
+async def generate_frontend_design(request: FrontendDesignRequest):
+    """
+    Generate a complete frontend UI design for all screens using OpenAI.
+    Returns a JSON with pixel-perfect element layouts for every screen,
+    streamed as SSE so the client can render screens progressively.
+    """
+    import time
+
+    if not OPENAI_API_KEY or not OPENAI_ENDPOINT:
+        raise HTTPException(status_code=500, detail="OpenAI not configured")
+
+    session_id = request.sessionId or f"session_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
+
+    # Build screen context from input
+    screens_info = ""
+    if request.screens:
+        for i, s in enumerate(request.screens, 1):
+            name = s.get("name", f"Screen {i}")
+            stype = s.get("type", "page")
+            desc = s.get("description", "")
+            screens_info += f"  {i}. \"{name}\" (type: {stype}) — {desc}\n"
+    else:
+        screens_info = "  Infer screens from the overview and features.\n"
+
+    flow_info = ""
+    if request.screenFlow:
+        flow_info = "SCREEN FLOW / NAVIGATION:\n" + "\n".join(f"  • {f}" for f in request.screenFlow) + "\n"
+
+    features_info = ""
+    if request.features:
+        features_info = "KEY FEATURES:\n" + "\n".join(f"  • {f}" for f in request.features) + "\n"
+
+    user_types_info = ""
+    if request.userTypes:
+        user_types_info = "USER TYPES: " + ", ".join(request.userTypes) + "\n"
+
+    system_prompt = (
+        "You are an expert UI/UX designer. Generate pixel-precise screen layouts as JSON.\n"
+        "Canvas: 1440×900. Elements: nav, rect, text, input, button, card, table, chart, image, list, form, modal.\n"
+        "Props: nav:{bg} | rect:{bg,borderColor,borderRadius} | text:{fontSize,fontWeight,color} | "
+        "input:{placeholder,inputType,borderRadius} | button:{bg,color,borderRadius} | card/table/chart/image/list/form/modal:{bg,borderRadius}\n\n"
+
+        "PAGE STRUCTURE:\n"
+        "App screens (dashboard/list/form/detail/settings/analytics/etc) MUST have:\n"
+        " 1) Top nav: nav x:0,y:0,w:1440,h:56 → app name(left), nav links(center, highlight current page), user profile+avatar(right)\n"
+        " 2) Sidebar: rect x:0,y:56,w:220,h:844,bg:#F8F9FA → nav items at x:20 starting y:76, h:40 each, current page highlighted\n"
+        " 3) Content: x:240,y:72 area. Page title at y:76 fontSize:24. Content starts y:140, width ~1180\n"
+        " 4) Footer: rect x:220,y:860,w:1220,h:40 → copyright text\n\n"
+        "Auth screens (login/signup): NO sidebar/nav. Background rect full canvas + centered card x:420,y:120,w:600,h:660 with logo, inputs, button. Optional branding panel on left.\n"
+        "Landing pages: Top nav with CTA buttons, hero section, feature cards grid, stats row, footer. NO sidebar.\n\n"
+
+        "SCREEN CONTENT (each screen MUST look different based on its type):\n"
+        " Dashboard→stat cards row + charts + recent-items table | List→search bar+filters+large data table+pagination\n"
+        " Form→labeled input groups in 2 columns+submit/cancel | Detail→entity header+status+tabbed info cards\n"
+        " Settings→category tabs left+form right | Analytics→date filters+2x2 chart grid | Calendar→toggle bar+calendar grid\n"
+        " Chat→contacts list left+messages center+detail right\n\n"
+
+        "NO-OVERLAP RULES (mandatory):\n"
+        " - Vertical: next element y >= prev.y + prev.h + 12\n"
+        " - Horizontal: next element x >= prev.x + prev.w + 16\n"
+        " - Text h = fontSize + 12 (e.g. fontSize:24→h:36, fontSize:14→h:26, fontSize:12→h:24)\n"
+        " - Input/button min h:40. Labels above inputs: label at y, input at y+label.h+4\n"
+        " - Children inside card/form: fit within parent bounds with 16px padding\n\n"
+
+        "CONTENT RULES (CRITICAL — violations produce garbage designs):\n"
+        " - ONLY design the screens listed in the user prompt. Do NOT invent extra screens.\n"
+        " - Screen names in the output MUST exactly match the screen names provided by the user.\n"
+        " - ALL text labels, button text, table column headers, input placeholders, card titles, chart titles,\n"
+        "   stat labels, and menu items MUST be derived from the application OVERVIEW, FEATURES, and SCREEN DESCRIPTIONS.\n"
+        " - NEVER use generic filler like 'Item 1', 'Column A', 'Card Title', 'Lorem ipsum', 'Sample Text', 'Click Here'.\n"
+        " - For each screen: read its name, type, and description → then pick the specific data fields, actions, and entities from the overview that belong on that screen.\n"
+        " - Nav links and sidebar items must be the actual screen names from the screens list.\n"
+        " - Table columns must reflect the real data fields of the entity shown (e.g. for a patient list: 'Patient ID', 'Name', 'Doctor', 'Status', 'Last Visit').\n"
+        " - Form inputs must have labels and placeholders matching real fields from the requirements.\n"
+        " - Stat card labels must reference real KPIs from the domain (e.g. 'Total Orders', 'Active Users', not 'Stat 1').\n\n"
+
+        "QUALITY:\n"
+        " - Colors: 1 primary + 1 accent for industry. Backgrounds #F9FAFB/#F3F4F6, headings #111827, body #374151, secondary #6B7280, borders #E5E7EB\n"
+        " - Typography: title 24/700, heading 18/600, body 14/400, label 13/500\n"
+        " - Border radius: cards 12, inputs 8, avatars 16. Each screen: 20-40 elements\n"
+        " - Tables: include 'columns' and 'rows' (3-5 domain-specific rows). Stats: real numbers. Charts: descriptive titles. Inputs: specific placeholders\n\n"
+
+        "OUTPUT: Return ONLY valid JSON:\n"
+        '{"appName":"...","screen":"<first>","screenType":"...","canvasWidth":1440,"canvasHeight":900,'
+        '"elements":[...],"allScreens":[{"name":"...","type":"...","elements":[...]},...]}\n'
+        'Element: {"type":"...","x":N,"y":N,"w":N,"h":N,"label":"...","props":{...}}'
+    )
+
+    # Build a per-screen breakdown so the model knows exactly what content each screen needs
+    screen_breakdown = ""
+    if request.screens:
+        screen_breakdown = "\nPER-SCREEN CONTEXT — use these descriptions to design each screen's content:\n"
+        all_features = request.features or []
+        for i, s in enumerate(request.screens, 1):
+            name = s.get("name", f"Screen {i}")
+            stype = s.get("type", "page").lower()
+            desc = s.get("description", "")
+            # Find features that relate to this screen by matching words
+            name_words = [w.lower() for w in name.split() if len(w) > 2]
+            desc_words = [w.lower() for w in desc.split() if len(w) > 3] if desc else []
+            search_words = name_words + desc_words
+            related = [f for f in all_features if any(word in f.lower() for word in search_words)]
+            screen_breakdown += f"\n  Screen {i}: '{name}' (type: {stype})\n"
+            screen_breakdown += f"    Description: {desc if desc else name}\n"
+            if related:
+                screen_breakdown += f"    Related features: {'; '.join(related)}\n"
+
+    user_prompt = f"""Design UI for: {request.applicationName}
+Industry: {request.industry or 'General'} | Type: {request.applicationType or 'Web App'} | Theme: {request.theme or 'modern'}
+
+APPLICATION OVERVIEW (read carefully — ALL screen content must come from this):
+{request.overview}
+
+SCREENS TO DESIGN (design ONLY these screens, use these EXACT names):
+{screens_info}
+{flow_info if flow_info else ''}{features_info if features_info else ''}{user_types_info if user_types_info else ''}{screen_breakdown}
+CRITICAL RULES:
+1. Design ONLY the screens listed above — no extra screens, no renamed screens.
+2. Every label, column, button, placeholder, stat title, and chart title must come from the OVERVIEW and FEATURES above. Zero generic text.
+3. Nav bar links and sidebar items = the screen names listed above.
+4. Each screen must have a different layout matching its type. Include nav+sidebar+footer on app screens. No overlapping elements."""
+
+    async def event_stream():
+        start = time.time()
+        yield f"data: {json.dumps({'field': 'thinking'})}\n\n"
+
+        accumulated = ""
+        emitted_screens = 0
+
+        def try_extract_screens(text: str, already_emitted: int):
+            """Try to extract completed screen objects from allScreens array as they stream in."""
+            screens_found = []
+            key = '"allScreens"'
+            idx = text.find(key)
+            if idx == -1:
+                return screens_found
+            arr_start = text.find('[', idx + len(key))
+            if arr_start == -1:
+                return screens_found
+            # Walk through the array looking for complete {...} objects
+            pos = arr_start + 1
+            depth = 0
+            in_str = False
+            obj_start = -1
+            obj_count = 0
+            while pos < len(text):
+                c = text[pos]
+                if in_str:
+                    if c == '\\':
+                        pos += 2
+                        continue
+                    if c == '"':
+                        in_str = False
+                else:
+                    if c == '"':
+                        in_str = True
+                    elif c == '{':
+                        if depth == 0:
+                            obj_start = pos
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0 and obj_start != -1:
+                            obj_count += 1
+                            if obj_count > already_emitted:
+                                try:
+                                    screen_obj = json.loads(text[obj_start:pos + 1])
+                                    screens_found.append(screen_obj)
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
+                            obj_start = -1
+                    elif c == ']' and depth == 0:
+                        break
+                pos += 1
+            return screens_found
+
+        try:
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_ENDPOINT)
+            stream = await client.chat.completions.create(
+                model=OPENAI_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_completion_tokens=MAX_OUTPUT_TOKENS,
+                response_format={"type": "json_object"},
+                stream=True,
+            )
+            async for event in stream:
+                if event.choices and event.choices[0].delta.content:
+                    accumulated += event.choices[0].delta.content
+
+                    # Try to emit newly completed screens as they arrive
+                    new_screens = try_extract_screens(accumulated, emitted_screens)
+                    for screen_obj in new_screens:
+                        emitted_screens += 1
+                        yield f"data: {json.dumps({'field': 'screen', 'index': emitted_screens - 1, 'data': screen_obj})}\n\n"
+
+            if not accumulated:
+                yield f"data: {json.dumps({'field': 'error', 'detail': 'OpenAI returned empty content'})}\n\n"
+                return
+
+            parsed = json.loads(accumulated)
+
+            # Emit any screens missed during streaming
+            all_screens = parsed.get("allScreens", [])
+            for i in range(emitted_screens, len(all_screens)):
+                yield f"data: {json.dumps({'field': 'screen', 'index': i, 'data': all_screens[i]})}\n\n"
+
+            # Emit the full design as well for clients that prefer it
+            yield f"data: {json.dumps({'field': 'design', 'data': parsed})}\n\n"
+
+            elapsed = round(time.time() - start, 2)
+            screen_count = len(all_screens)
+            yield f"data: {json.dumps({'field': 'done', 'screenCount': screen_count, 'elapsed': elapsed})}\n\n"
+
+        except json.JSONDecodeError:
+            logger.error(f"Frontend design: invalid JSON. Raw: {accumulated[:500]}")
+            yield f"data: {json.dumps({'field': 'error', 'detail': 'OpenAI returned invalid JSON'})}\n\n"
+        except Exception as e:
+            logger.error(f"Frontend design OpenAI error: {e}")
+            yield f"data: {json.dumps({'field': 'error', 'detail': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
